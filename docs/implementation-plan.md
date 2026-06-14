@@ -370,29 +370,6 @@ Caveat: Claude Code's trace export is **beta** (span names/attributes may change
 
 ---
 
-## Phase 11 — Trace accuracy verification & cache-aware cost (active, 2026-06-14)
-
-Added after a token/cost audit of a large multi-subagent session. Full detail + commands: **`docs/trace-accuracy-and-pricing.md`**. Tooling lives in **`tools/`**.
-
-**Context.** The dashboard's everyday numbers were already correct (they SUM the cache-aware `gen_ai.usage.cost` the CLI stamps at capture). But the server *recompute* path (`computeCostForTrace`) was **cache-blind** — it priced the cache-*inclusive* `input_tokens` entirely at the input rate, because the model schema only stores input+output rates (so "Manage Models" only asks for two prices). On the audited session the cache-blind recompute = $202 vs the correct $41.58 (~4.9×). It only fires via the manual **Recalculate** button or a cron backfill of an un-costed span.
-
-### Done (shipped in this repo)
-- [x] **`tools/cc_pricing.py`** — pricing oracle (port of `pricing.go`) + self-test proving opus-4-8 cache math ($5/$25/$0.50/$6.25, flat).
-- [x] **`tools/reconcile_session.py`** — reconciles a session's raw transcript (ground truth) ↔ ClickHouse store; PASS/FAIL on token identity, **cost identity (scan for cache-blind-corrupted spans)**, coverage, double-count, tool dedupe, async taxonomy. Proven on real sessions.
-- [x] **Cache-aware recompute** — `computeCostForTrace` splits fresh/cache_read/cache_creation and prices each tier (reads the stored dotted cache keys), with Anthropic published multipliers (read 0.1×, write 1.25×) as fallback so opus-4-8 is correct even with input+output-only model records.
-- [x] **Recalculate guard** — `setPricingForSpanId` refuses to overwrite a span already carrying a captured cost. `pricing.test.ts` +3 tests (20/20 pass, tsc clean).
-- [x] **`tools/fix_mojibake.py`** — repairs UTF-8-double-encoded-as-CP1252 text (used to fix the `docs/` diagrams).
-- [x] Folded in prior uncommitted fixes: subagent token capture (`subagents.go`, `handle.go`) + cost-chip double-count (`helpers/client/trace.ts`).
-
-### Remaining
-- [ ] **Deploy the pricing fix** — rebuild the client image (it bakes `src`): `docker compose -p openlit -f dev-docker-compose.yml up -d --build openlit`. Verify: Recalculate refuses on a costed opus-4-8 turn; an un-costed turn re-prices cache-aware (not ~5× high). *No migration needed.*
-- [ ] **Clean up the double-counted session** — `reconcile_session.py` found a historically-backfilled session whose backfill rows now coexist with forward-capture rows (≈2× tokens/cost). Verify-before-delete (non-backfill sum ≈ truth), then `ALTER TABLE openlit.otel_traces DELETE WHERE … AND SpanAttributes['coding_agent.backfill_source']='subagent-transcript-v1'`; re-run the reconciler as the gate.
-- [ ] **(Optional) Schema chain for explicit cache rates** — only needed to enter explicit/contract cache rates or fix non-Anthropic cache pricing (Anthropic already self-corrects via fallback). New ClickHouse `ALTER TABLE openlit_provider_models ADD COLUMN cache_read_price_per_m_token, cache_creation_price_per_m_token` migration → `provider-registry.ts` SELECT/map → `models-service.ts` writes → `model-editor-panel.tsx` two inputs + `en.ts` labels → `default-models.ts` seed. Ship together; run the migration before the new client serves traffic. Types already carry the optional fields.
-- [ ] **(Optional) CLI subagent-capture accuracy** — closes a ~0.2% drift: in `cli/internal/coding/hook/claudecode/subagents.go` take the **final** streaming fragment's usage and dedupe turns by `requestId` (one API request → one `llm.turn`). Go rebuild + binary swap; `reconcile_session.py` is the acceptance gate. (Fixes data captured *after* the swap only.)
-- [ ] **(Optional) Trace-detail cache-token display** — `constants/traces.ts` maps cache tokens to `gen_ai.usage.cache_read.input_tokens`, but the store uses the dotted `gen_ai.usage.cache.read_input_tokens`; the panel likely shows "–" for coding-agent spans. Verify in UI; if confirmed, add the dotted key as a fallback path.
-
----
-
 ## Overall acceptance criteria (definition of done)
 
 - [ ] OpenLIT platform built **from source** and running locally; default password changed; `TELEMETRY_ENABLED=false`.
