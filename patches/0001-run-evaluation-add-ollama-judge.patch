@@ -1,0 +1,29 @@
+From 28ee8c5d195be7ff78ae3e8290025c5383b5e393 Mon Sep 17 00:00:00 2001
+From: Sean McCarthy <sean.mccarthy3223@gmail.com>
+Date: Sat, 13 Jun 2026 18:46:42 -0500
+Subject: [PATCH] Add local Ollama judge provider for air-gapped evals
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ src/client/src/lib/platform/evaluation/run-evaluation.ts | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/src/client/src/lib/platform/evaluation/run-evaluation.ts b/src/client/src/lib/platform/evaluation/run-evaluation.ts
+index 1a12ca6d..6eaa29cc 100644
+--- a/src/client/src/lib/platform/evaluation/run-evaluation.ts
++++ b/src/client/src/lib/platform/evaluation/run-evaluation.ts
+@@ -108,6 +108,11 @@ function getModel(provider: string, model: string, apiKey: string) {
+ 				baseURL: "https://api.fireworks.ai/inference/v1",
+ 				apiKey,
+ 			})(model);
++		case "ollama":
++			return createOpenAI({
++				baseURL: process.env.OLLAMA_BASE_URL ?? "http://host.docker.internal:11434/v1",
++				apiKey: apiKey || "ollama",
++			})(model);
+ 		default:
+ 			throw new Error(`Provider ${provider} not supported for evaluation`);
+ 	}
+-- 
+2.49.0.windows.1
+

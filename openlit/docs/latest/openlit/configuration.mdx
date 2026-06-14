@@ -1,0 +1,255 @@
+---
+title: 'Configuration'
+description: 'Configuring Options for OpenLIT'
+icon: 'sliders'
+---
+
+This guide covers all the available environment variables to fine-tune OpenLIT according to your needs.
+
+## Environment variables
+
+<ResponseField name="INIT_DB_HOST" required>
+  Sets the host address of the ClickHouse server for OpenLIT to connect
+
+  **Example**:
+  ```yaml
+  export INIT_DB_HOST=127.0.0.1
+  ```
+</ResponseField>
+
+<ResponseField name="INIT_DB_PORT" required>
+  Sets the port on which ClickHouse listens
+
+  **Example**:
+  ```yaml
+  export INIT_DB_PORT=8123
+  ```
+</ResponseField>
+
+<ResponseField name="INIT_DB_DATABASE" required>
+  Sets the name of the database in Clickhouse to be used by OpenLIT
+
+  **Example**:
+  ```yaml
+  export INIT_DB_DATABASE=default
+  ```
+</ResponseField>
+
+<ResponseField name="INIT_DB_USERNAME" required>
+  Sets the username for authenticating with ClickHouse
+
+  **Example**:
+  ```yaml
+  export INIT_DB_USERNAME=default
+  ```
+</ResponseField>
+
+<ResponseField name="INIT_DB_PASSWORD" required>
+  Sets the password for authenticating with ClickHouse
+
+  **Example**:
+  ```yaml
+  export INIT_DB_PASSWORD=default
+  ```
+</ResponseField>
+
+<ResponseField name="SQLITE_DATABASE_URL" required>
+  Sets the location where SQLITE data is stored.
+
+  **Example**:
+  ```yaml
+  export SQLITE_DATABASE_URL=file:/app/client/data/data.db
+  ```
+</ResponseField>
+
+## OAuth authentication variables
+
+<Note>
+For detailed OAuth setup instructions, see the [OAuth Authentication Setup](/latest/openlit/oauth) guide.
+</Note>
+
+<ResponseField name="NEXTAUTH_URL">
+  Sets the canonical URL of your site for NextAuth.js authentication
+
+  **Example**:
+  ```yaml
+  export NEXTAUTH_URL=http://localhost:3000
+  ```
+</ResponseField>
+
+<ResponseField name="NEXTAUTH_SECRET">
+  Used to encrypt the NextAuth.js JWT tokens and email verification hashes
+
+  **Example**:
+  ```yaml
+  export NEXTAUTH_SECRET=your-secret-here
+  ```
+  
+  **Generate with**: `openssl rand -base64 32`
+</ResponseField>
+
+<ResponseField name="GOOGLE_CLIENT_ID">
+  Google OAuth client ID for Google sign-in integration
+
+  **Example**:
+  ```yaml
+  export GOOGLE_CLIENT_ID=your-google-client-id
+  ```
+</ResponseField>
+
+<ResponseField name="GOOGLE_CLIENT_SECRET">
+  Google OAuth client secret for Google sign-in integration
+
+  **Example**:
+  ```yaml
+  export GOOGLE_CLIENT_SECRET=your-google-client-secret
+  ```
+</ResponseField>
+
+<ResponseField name="GITHUB_CLIENT_ID">
+  GitHub OAuth client ID for GitHub sign-in integration
+
+  **Example**:
+  ```yaml
+  export GITHUB_CLIENT_ID=your-github-client-id
+  ```
+</ResponseField>
+
+<ResponseField name="GITHUB_CLIENT_SECRET">
+  GitHub OAuth client secret for GitHub sign-in integration
+
+  **Example**:
+  ```yaml
+  export GITHUB_CLIENT_SECRET=your-github-client-secret
+  ```
+</ResponseField>
+
+## Security variables
+
+OpenLIT enables stricter API protections by default, including security response headers, CSRF checks for browser session API requests, vault secret encryption, and restricted CORS for the vault secrets API.
+
+<ResponseField name="OPENLIT_VAULT_ENCRYPTION_KEY">
+  Secret used to encrypt Vault values at rest with AES-256-GCM. If this is not set, OpenLIT falls back to `NEXTAUTH_SECRET`.
+
+  Use a stable, high-entropy value and keep it unchanged across restarts. Changing this value after secrets are encrypted prevents existing Vault values from being decrypted.
+
+  **Generate with**:
+  ```bash
+  openssl rand -base64 32
+  ```
+
+  **Example**:
+  ```yaml
+  export OPENLIT_VAULT_ENCRYPTION_KEY=your-vault-encryption-key
+  ```
+</ResponseField>
+
+<ResponseField name="OPENLIT_ALLOWED_CORS_ORIGINS">
+  Comma-separated list of browser origins that are allowed to call API-key authenticated Vault secret retrieval from another domain.
+
+  Configure this when a browser application hosted on a different origin needs to call `POST /api/vault/get-secrets`. Server-to-server SDK or REST calls usually do not need this because they do not send a browser `Origin` header.
+
+  Specify complete origins, including scheme and host. Do not use `*`.
+
+  **Example**:
+  ```yaml
+  export OPENLIT_ALLOWED_CORS_ORIGINS=https://app.example.com,https://admin.example.com
+  ```
+</ResponseField>
+
+<ResponseField name="OPENLIT_ALLOWED_ORIGINS">
+  Backward-compatible alias for `OPENLIT_ALLOWED_CORS_ORIGINS`.
+
+  **Example**:
+  ```yaml
+  export OPENLIT_ALLOWED_ORIGINS=https://app.example.com
+  ```
+</ResponseField>
+
+<Note>
+  `NEXTAUTH_URL` is also treated as an allowed same-site origin for Vault CORS checks. Browser requests from other domains must be listed in `OPENLIT_ALLOWED_CORS_ORIGINS` or `OPENLIT_ALLOWED_ORIGINS`.
+</Note>
+
+## Environment file placement
+
+Environment variables can be configured in multiple ways depending on your deployment method:
+
+### Development setup
+
+<Steps>
+  <Step title="Client-side .env">
+    Create a `.env` file in the `src/client/` directory for development:
+    ```bash
+    src/client/.env
+    ```
+    This file is automatically loaded by Next.js during development.
+  </Step>
+  
+  <Step title="Docker Compose .env">
+    Create a `.env` file in the same directory as your `docker-compose.yml` file:
+    ```bash
+    # In the root directory with docker-compose.yml
+    .env
+    ```
+    This file is automatically loaded by Docker Compose.
+  </Step>
+  
+  <Step title="Development Docker Compose .env">
+    For development Docker setup, create a `.env` file alongside `src/dev-docker-compose.yml`:
+    ```bash
+    # In the src/ directory with dev-docker-compose.yml
+    src/.env
+    ```
+  </Step>
+</Steps>
+
+### Production setup
+
+For production deployments, set environment variables directly in your hosting platform or container orchestration system (Kubernetes, Docker Swarm, etc.).
+
+## Sample environment file (.env)
+
+```.env.example .env
+# Database Configuration
+INIT_DB_HOST="127.0.0.1"
+INIT_DB_PORT="8123"
+INIT_DB_DATABASE="default"
+INIT_DB_USERNAME="default"
+INIT_DB_PASSWORD="OPENLIT"
+SQLITE_DATABASE_URL="file:/app/client/data/data.db"
+
+# NextAuth Configuration (Optional)
+NEXTAUTH_URL="http://localhost:3000"
+NEXTAUTH_SECRET="your-secret-here"
+
+# OAuth Providers (Optional)
+GOOGLE_CLIENT_ID="your-google-client-id"
+GOOGLE_CLIENT_SECRET="your-google-client-secret"
+GITHUB_CLIENT_ID="your-github-client-id"
+GITHUB_CLIENT_SECRET="your-github-client-secret"
+
+# Security Configuration (Optional)
+OPENLIT_VAULT_ENCRYPTION_KEY="your-vault-encryption-key"
+OPENLIT_ALLOWED_CORS_ORIGINS="https://app.example.com,https://admin.example.com"
+```
+
+---
+
+<CardGroup cols={3}>
+  <Card title="Create a dashboard" href="/latest/openlit/dashboards/overview" icon='grid'>
+    Create custom visualizations with flexible widgets, queries, and real-time AI monitoring
+  </Card>
+  <Card title="Manage prompts" href="/latest/openlit/prompts-experiments/prompt-hub" icon='message'>
+    Version, deploy, and collaborate on prompts with centralized management and tracking
+  </Card>
+  <Card title="LLM playground" href="/latest/openlit/prompts-experiments/openground" icon='flask'>
+    Compare cost, duration, and response tokens across different LLMs to find the most efficient model
+  </Card>
+</CardGroup>
+<Card
+    title="Zero-code observability with the OpenLIT Controller"
+    icon="tower-broadcast"
+    href="/latest/controller/overview"
+  >
+  Discover and instrument LLM traffic across Kubernetes, Docker, and Linux using eBPF — no code changes required.
+  </Card>

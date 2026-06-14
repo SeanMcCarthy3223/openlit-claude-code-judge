@@ -1,0 +1,29 @@
+From 51f7cc0472e7548f2d88aca044c779a51b936ab4 Mon Sep 17 00:00:00 2001
+From: Sean McCarthy <sean.mccarthy3223@gmail.com>
+Date: Sat, 13 Jun 2026 22:21:04 -0500
+Subject: [PATCH] Add ollama provider to chat/trace-analysis getModelInstance
+ (local judge)
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ src/client/src/lib/platform/chat/stream.ts | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/src/client/src/lib/platform/chat/stream.ts b/src/client/src/lib/platform/chat/stream.ts
+index 6c33c56e..2d719573 100644
+--- a/src/client/src/lib/platform/chat/stream.ts
++++ b/src/client/src/lib/platform/chat/stream.ts
+@@ -37,6 +37,10 @@ const providerFactories: Record<string, ProviderFactory> = {
+ 	xai: (apiKey) => createOpenAI({ baseURL: "https://api.x.ai/v1", apiKey }),
+ 	huggingface: (apiKey) => createOpenAI({ baseURL: "https://api-inference.huggingface.co/v1", apiKey }),
+ 	replicate: (apiKey) => createOpenAI({ baseURL: "https://openai-proxy.replicate.com/v1", apiKey }),
++	ollama: (apiKey) => createOpenAI({
++		baseURL: process.env.OLLAMA_BASE_URL ?? "http://host.docker.internal:11434/v1",
++		apiKey: apiKey || "ollama",
++	}),
+ };
+ 
+ const VALID_PROVIDERS = Object.keys(providerFactories);
+-- 
+2.49.0.windows.1
+

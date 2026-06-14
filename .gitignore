@@ -1,0 +1,23 @@
+# Secrets — never commit
+.env
+**/.env
+!**/.env.example
+
+# Local tooling / orchestration state
+.omc/
+
+# Build artifacts
+node_modules/
+**/node_modules/
+.next/
+**/.next/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Logs
+*.log
+npm-debug.log*
