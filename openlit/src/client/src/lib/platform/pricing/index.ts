@@ -18,6 +18,11 @@ import Sanitizer from "@/utils/sanitizer";
 import asaw from "@/utils/asaw";
 
 const COST_KEY = getTraceMappingKeyFullPath("cost") as string; // gen_ai.usage.cost
+// Present ONLY on the coding-agent session ROOT span. That span carries a
+// whole-session aggregate (its gen_ai.usage.* totals are the sum of every
+// turn across all agents) priced against a single gen_ai.request.model, so
+// it must never be (re)priced — see computeCostForTrace.
+const SESSION_AGGREGATE_KEY = "coding_agent.session.cost_usd";
 const MODEL_KEY = getTraceMappingKeyFullPath("model") as string; // gen_ai.request.model
 const PROVIDER_KEY = getTraceMappingKeyFullPath("provider") as string; // gen_ai.system
 const TYPE_KEY = getTraceMappingKeyFullPath("type") as string; // gen_ai.operation.name
@@ -25,6 +30,26 @@ const PROMPT_TOKENS_KEYS = getTraceMappingKeyFullPaths("promptTokens") as string
 const COMPLETION_TOKENS_KEYS = getTraceMappingKeyFullPaths(
 	"completionTokens"
 ) as string[];
+// Cache-token attribute keys vary by span source: the coding-agent CLI (and the
+// verified ClickHouse store) write the dotted "cache." form, while the OpenLIT
+// SDK trace-mapping uses "cache_read.". We read both, plus the raw Anthropic
+// field name, so cache pricing works regardless of who produced the span.
+const CACHE_READ_TOKENS_KEYS = [
+	"gen_ai.usage.cache.read_input_tokens", // coding-agent CLI / store (verified live)
+	"gen_ai.usage.cache_read.input_tokens", // openlit SDK trace-mapping form
+	"cache_read_input_tokens", // raw Anthropic usage field
+];
+const CACHE_CREATION_TOKENS_KEYS = [
+	"gen_ai.usage.cache.creation_input_tokens",
+	"gen_ai.usage.cache_creation.input_tokens",
+	"cache_creation_input_tokens",
+];
+// Anthropic's published prompt-cache multipliers, used only when a model record
+// has no explicit per-tier cache rate configured. Reads are ~0.1x input, writes
+// ~1.25x input. (cli/internal/coding/pricing/pricing.go encodes the same ratios
+// as absolute rates, e.g. opus-4-8 input $5 -> cache-read $0.50, cache-write $6.25.)
+const ANTHROPIC_CACHE_READ_MULTIPLIER = 0.1;
+const ANTHROPIC_CACHE_WRITE_MULTIPLIER = 1.25;
 
 interface TraceRow {
 	SpanId: string;
@@ -63,6 +88,20 @@ async function computeCostForTrace(
 	trace: TraceRow,
 	databaseConfigId: string
 ): Promise<{ cost: number | null; reason?: string }> {
+	// Never (re)price the coding-agent session ROOT span. Its tokens are the
+	// sum of every turn across all agents, priced against a single model, so
+	// pricing it values a mixed-model run (e.g. an Opus orchestrator + Haiku
+	// subagents) at one model's rate AND duplicates the per-turn leaves. The
+	// individual `coding_agent.llm.turn` spans are the priceable units; the
+	// session span already carries an authoritative coding_agent.session.cost_usd.
+	if (getAttr(trace, SESSION_AGGREGATE_KEY) !== "") {
+		return {
+			cost: null,
+			reason:
+				"Span is a coding-agent session aggregate (carries coding_agent.session.cost_usd); only per-turn spans are priced.",
+		};
+	}
+
 	const provider = getAttr(trace, PROVIDER_KEY);
 	const model = getAttr(trace, MODEL_KEY);
 	const promptTokens = getNumericAttr(trace, PROMPT_TOKENS_KEYS);
@@ -89,11 +128,47 @@ async function computeCostForTrace(
 		return { cost: null, reason };
 	}
 
-	const inputCost = (promptTokens / 1_000_000) * modelMeta.inputPricePerMToken;
-	const outputCost =
-		(completionTokens / 1_000_000) * modelMeta.outputPricePerMToken;
+	// promptTokens (gen_ai.usage.input_tokens) is the TOTAL input the model saw
+	// and INCLUDES cache reads + cache writes — the coding-agent CLI sums them
+	// in at capture (see handle.go: ti += fresh + creation + read). Pricing the
+	// whole thing at the input rate over-bills cache-heavy turns by up to ~5x,
+	// because Anthropic cache reads cost ~0.1x input and cache writes ~1.25x.
+	// Split the tiers and price each, mirroring the CLI oracle pricing.go Cost().
+	const cacheReadTokens = getNumericAttr(trace, CACHE_READ_TOKENS_KEYS);
+	const cacheCreationTokens = getNumericAttr(trace, CACHE_CREATION_TOKENS_KEYS);
+	const freshInput = Math.max(
+		0,
+		promptTokens - cacheReadTokens - cacheCreationTokens
+	);
 
-	return { cost: inputCost + outputCost };
+	const inputRate = modelMeta.inputPricePerMToken;
+	const isAnthropic = provider.toLowerCase().includes("anthropic");
+	// Use the explicit per-model cache rate when configured (Manage Models);
+	// otherwise fall back to the provider's published cache multiplier so cache
+	// pricing is correct even before per-model rates are entered. For non-cache
+	// vendors this collapses to the input rate (a no-op when cache tokens are 0).
+	const cacheReadRate =
+		modelMeta.cacheReadPricePerMToken && modelMeta.cacheReadPricePerMToken > 0
+			? modelMeta.cacheReadPricePerMToken
+			: isAnthropic
+				? inputRate * ANTHROPIC_CACHE_READ_MULTIPLIER
+				: inputRate;
+	const cacheCreationRate =
+		modelMeta.cacheCreationPricePerMToken &&
+		modelMeta.cacheCreationPricePerMToken > 0
+			? modelMeta.cacheCreationPricePerMToken
+			: isAnthropic
+				? inputRate * ANTHROPIC_CACHE_WRITE_MULTIPLIER
+				: inputRate;
+
+	const cost =
+		(freshInput * inputRate +
+			cacheReadTokens * cacheReadRate +
+			cacheCreationTokens * cacheCreationRate +
+			completionTokens * modelMeta.outputPricePerMToken) /
+		1_000_000;
+
+	return { cost };
 }
 
 /**
@@ -137,6 +212,27 @@ export async function setPricingForSpanId(spanId: string) {
 	);
 
 	const trace = spanData as TraceRow;
+
+	// Defense-in-depth: never overwrite an authoritative captured cost.
+	// Coding-agent CLIs (Claude Code / Cursor / Codex) stamp gen_ai.usage.cost
+	// at ingest using CACHE-AWARE pricing (Anthropic cache reads ~0.1x input,
+	// cache writes ~1.25x input). Recomputing here from the Manage-Models rates
+	// would silently replace that — and because the model schema currently
+	// carries only input+output rates (no cache tiers), the recompute is
+	// CACHE-BLIND and over-bills cache-heavy turns by up to ~5x. So we refuse
+	// to re-price a span that already has a non-zero captured cost, mirroring
+	// the autoUpdatePricing backfill guard (see that function's comment).
+	const existingCost = getAttr(trace, COST_KEY);
+	if (existingCost !== "" && Number(existingCost) > 0) {
+		return {
+			success: false,
+			err: `Span already carries an authoritative captured cost ($${Number(
+				existingCost
+			).toFixed(
+				6
+			)}). Vendor/CLI cost is cache-aware and treated as the source of truth; refusing to overwrite it with a recomputed value.`,
+		};
+	}
 
 	// The trace itself doesn't tell us the dbConfig; fall back to the default
 	const { default: prisma } = await import("@/lib/prisma");

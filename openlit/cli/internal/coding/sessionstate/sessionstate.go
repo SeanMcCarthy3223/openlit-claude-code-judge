@@ -157,6 +157,26 @@ type State struct {
 	// content. Bounded to the most recent ~256 ids.
 	EmittedAssistantTurnIDs []string `json:"emitted_assistant_turn_ids,omitempty"`
 
+	// SubagentOffsets is the per-file byte position the subagent
+	// transcript reader last committed for each
+	// `subagents/**/agent-<id>.jsonl`. Subagents keep their conversation
+	// in separate files the main transcript reader never sees; this lets
+	// each hook event resume reading only the new tail per subagent
+	// file. See cli/internal/coding/hook/claudecode/subagents.go.
+	SubagentOffsets map[string]int64 `json:"subagent_offsets,omitempty"`
+
+	// SubagentToolIndex maps a `tool_use` id to the agent id of the
+	// subagent that issued it. Populated as subagent transcripts are
+	// drained; read by the PostToolUse handler to stamp
+	// `coding_agent.agent.id` on the matching tool.call span so each
+	// action is attributed to its owning subagent. Bounded.
+	SubagentToolIndex map[string]string `json:"subagent_tool_index,omitempty"`
+
+	// EmittedSubagentTurnIDs de-dups subagent LLM-turn spans across
+	// drains (keyed by `<agentID>|<requestId|uuid>`). Bounded to the
+	// most recent ~1024 keys.
+	EmittedSubagentTurnIDs []string `json:"emitted_subagent_turn_ids,omitempty"`
+
 	// CodexTurns holds per-turn fragments for the Codex adapter,
 	// keyed by Codex's `turn_id`. Codex's hook protocol scopes
 	// every event to a turn (UserPromptSubmit, PreToolUse,

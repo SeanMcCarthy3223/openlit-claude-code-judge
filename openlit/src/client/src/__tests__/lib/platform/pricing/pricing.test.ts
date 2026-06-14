@@ -245,6 +245,34 @@ describe('setPricingForSpanId', () => {
     await expect(setPricingForSpanId('span-1')).rejects.toThrow('Unauthorized');
   });
 
+  it('skips the coding-agent session aggregate span (does not re-price it)', async () => {
+    (getCurrentUser as jest.Mock).mockResolvedValue({ id: 'user-1' });
+    (getRequestViaSpanId as jest.Mock).mockResolvedValue({
+      record: {
+        SpanId: 'session-root',
+        Timestamp: '2026-01-01',
+        SpanAttributes: {
+          // Aggregate session root: single model + summed tokens, plus the
+          // tell-tale session.cost_usd. Must NOT be priced (would value a
+          // mixed-model run at Opus rates → the $20 inflation bug).
+          'gen_ai.system': 'anthropic',
+          'gen_ai.request.model': 'claude-opus-4-8',
+          'gen_ai.usage.input_tokens': '3844025',
+          'gen_ai.usage.output_tokens': '37143',
+          'coding_agent.session.cost_usd': '20.1487',
+        },
+      },
+    });
+
+    const result = await setPricingForSpanId('session-root');
+
+    expect(result.success).toBe(false);
+    expect(result.err).toContain('session aggregate');
+    // Crucially: never reached the provider registry or wrote a cost.
+    expect(ProviderRegistry.getModel).not.toHaveBeenCalled();
+    expect(dataCollector).not.toHaveBeenCalled();
+  });
+
   it('returns error when zero tokens', async () => {
     (getCurrentUser as jest.Mock).mockResolvedValue({ id: 'user-1' });
     (getRequestViaSpanId as jest.Mock).mockResolvedValue({
@@ -294,6 +322,106 @@ describe('setPricingForSpanId', () => {
 
     expect(result.success).toBe(false);
     expect(result.err).toBe('DB config not found');
+  });
+
+  it('refuses to overwrite a span that already has an authoritative captured cost', async () => {
+    (getCurrentUser as jest.Mock).mockResolvedValue({ id: 'user-1' });
+    (getRequestViaSpanId as jest.Mock).mockResolvedValue({
+      record: {
+        SpanId: 'span-1',
+        Timestamp: '2026-01-01',
+        SpanAttributes: {
+          'gen_ai.system': 'anthropic',
+          'gen_ai.request.model': 'claude-opus-4-8',
+          'gen_ai.usage.input_tokens': '3844025',
+          'gen_ai.usage.output_tokens': '37143',
+          // CLI already stamped a cache-aware cost; manual Recalculate must NOT
+          // clobber it (the cache-blind recompute would be ~5x higher).
+          'gen_ai.usage.cost': '41.5789',
+        },
+      },
+    });
+
+    const result = await setPricingForSpanId('span-1');
+
+    expect(result.success).toBe(false);
+    expect(result.err).toContain('authoritative');
+    // Must short-circuit before touching the registry or writing anything.
+    expect(ProviderRegistry.getModel).not.toHaveBeenCalled();
+    expect(dataCollector).not.toHaveBeenCalled();
+  });
+
+  it('prices cache tiers separately with explicit per-model cache rates', async () => {
+    (getCurrentUser as jest.Mock).mockResolvedValue({ id: 'user-1' });
+    (getRequestViaSpanId as jest.Mock).mockResolvedValue({
+      record: {
+        SpanId: 'span-1',
+        Timestamp: '2026-01-01',
+        SpanAttributes: {
+          'gen_ai.system': 'anthropic',
+          'gen_ai.request.model': 'claude-opus-4-8',
+          // input_tokens INCLUDES cache (CLI convention); no captured cost so
+          // the guard allows pricing.
+          'gen_ai.usage.input_tokens': '3844025',
+          'gen_ai.usage.output_tokens': '37143',
+          'gen_ai.usage.cache.read_input_tokens': '3000000',
+          'gen_ai.usage.cache.creation_input_tokens': '500000',
+        },
+      },
+    });
+    (ProviderRegistry.getModel as jest.Mock).mockResolvedValue({
+      id: 'claude-opus-4-8',
+      inputPricePerMToken: 5.0,
+      outputPricePerMToken: 25.0,
+      cacheReadPricePerMToken: 0.5,
+      cacheCreationPricePerMToken: 6.25,
+    });
+    (dataCollector as jest.Mock).mockResolvedValue({ err: null });
+
+    const result = await setPricingForSpanId('span-1');
+
+    const fresh = 3844025 - 3000000 - 500000;
+    const expected =
+      (fresh * 5.0 + 3000000 * 0.5 + 500000 * 6.25 + 37143 * 25.0) / 1_000_000;
+    expect(result.success).toBe(true);
+    expect(result.data!.cost).toBeCloseTo(expected, 6);
+    // Sanity: must be far below the cache-blind value (entire input at $5/M).
+    const cacheBlind = (3844025 * 5.0 + 37143 * 25.0) / 1_000_000;
+    expect(result.data!.cost).toBeLessThan(cacheBlind / 2);
+  });
+
+  it('falls back to Anthropic cache multipliers when no per-model cache rates are set', async () => {
+    (getCurrentUser as jest.Mock).mockResolvedValue({ id: 'user-1' });
+    (getRequestViaSpanId as jest.Mock).mockResolvedValue({
+      record: {
+        SpanId: 'span-1',
+        Timestamp: '2026-01-01',
+        SpanAttributes: {
+          'gen_ai.system': 'anthropic',
+          'gen_ai.request.model': 'claude-opus-4-8',
+          'gen_ai.usage.input_tokens': '3844025',
+          'gen_ai.usage.output_tokens': '37143',
+          'gen_ai.usage.cache.read_input_tokens': '3000000',
+          'gen_ai.usage.cache.creation_input_tokens': '500000',
+        },
+      },
+    });
+    // Model added with ONLY input+output (exactly what Manage Models collects today).
+    (ProviderRegistry.getModel as jest.Mock).mockResolvedValue({
+      id: 'claude-opus-4-8',
+      inputPricePerMToken: 5.0,
+      outputPricePerMToken: 25.0,
+    });
+    (dataCollector as jest.Mock).mockResolvedValue({ err: null });
+
+    const result = await setPricingForSpanId('span-1');
+
+    // 5 * 0.1 = 0.50 (read), 5 * 1.25 = 6.25 (write) -> same as explicit rates.
+    const fresh = 3844025 - 3000000 - 500000;
+    const expected =
+      (fresh * 5.0 + 3000000 * 0.5 + 500000 * 6.25 + 37143 * 25.0) / 1_000_000;
+    expect(result.success).toBe(true);
+    expect(result.data!.cost).toBeCloseTo(expected, 6);
   });
 });
 

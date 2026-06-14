@@ -81,6 +81,14 @@ func handle(ctx context.Context, in normalize.Input) error {
 	// long sessions don't accumulate unread tail.
 	drainAssistantTurns(in, p)
 
+	// Subagents (Task tool + workflow subagents) keep their conversation
+	// in separate transcript files the main drain never sees. This emits
+	// their per-turn LLM-turn spans (tagged with the owning agent id) and
+	// refreshes the tool_use -> agent index PostToolUse uses to attribute
+	// each tool.call span to its subagent. See subagents.go. Runs after
+	// the main drain so the tool index is fresh before emitToolCall.
+	drainSubagentTurns(in, p)
+
 	switch event {
 	case "SessionStart":
 		return emitSession(in, p, vcs, cls, "started", time.Time{})
@@ -528,10 +536,20 @@ func emitSession(
 			s.Model = model
 		}
 		if kind == "ended" {
-			s.CostUSD = cost
-			s.InputTokens = in0
-			s.OutputTokens = out0
-			s.TotalTokens = total
+			// Fold in subagent usage. tailTranscript reads ONLY the main
+			// transcript; subagent turns are drained into their own
+			// llm.turn spans (see subagents.go) but their tokens/cost must
+			// also be added to the session-root rollup so the Sessions
+			// list (which prefers the root span's totals over child sums)
+			// reflects the FULL workload, not just the main loop.
+			su := sumSubagentUsage(p.TranscriptPath)
+			s.CostUSD = cost + su.CostUSD
+			s.InputTokens = in0 + su.InputTokens
+			s.OutputTokens = out0 + su.OutputTokens
+			s.TotalTokens = total + su.InputTokens + su.OutputTokens
+			if su.SubagentCount > 0 {
+				s.SubagentCount = su.SubagentCount
+			}
 		}
 	}
 
@@ -576,6 +594,18 @@ func emitToolCall(in normalize.Input, p claudePayload, vcs git.Context, cls clas
 		WorkingDir: p.CWD,
 		StartedAt:  time.Now(),
 		EndedAt:    time.Now(),
+	}
+	// Attribute the tool call to its owning subagent when it ran inside
+	// one. drainSubagentTurns indexes tool_use ids -> agent id from the
+	// subagent transcripts; a hit means this PostToolUse fired for an
+	// action taken inside that subagent. Main-agent tool calls miss the
+	// index and stay unattributed (correctly attributed to the session).
+	if p.ToolUseID != "" && p.SessionID != "" {
+		if st := sessionstate.Load(p.SessionID, "claude-code"); st != nil {
+			if aid := st.SubagentToolIndex[p.ToolUseID]; aid != "" {
+				t.AgentID = aid
+			}
+		}
 	}
 	// Surface a Bash command as the tool's canonical command so the
 	// trace-detail view's "Shell" pill renders the right summary. The

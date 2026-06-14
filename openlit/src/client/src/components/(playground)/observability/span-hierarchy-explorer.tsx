@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
-import { BarChart3, DollarSign, GitBranch, MessageSquareText, Network, Sparkles } from "lucide-react";
+import { BarChart3, Bot, DollarSign, GitBranch, MessageSquareText, Network, Sparkles } from "lucide-react";
 import useFetchWrapper from "@/utils/hooks/useFetchWrapper";
 import { TraceHeirarchySpan } from "@/types/trace";
 import {
@@ -13,17 +13,20 @@ import TreeNode from "@/components/(playground)/request/components/tree-node";
 import TimelineView from "@/components/(playground)/request/components/timeline-view";
 import NodeGraph from "@/components/(playground)/request/components/node-graph";
 import ChatView from "@/components/(playground)/request/components/chat-view";
+import SubagentBreakdownTable from "@/components/(playground)/request/components/subagent-breakdown";
 import TraceAiAnalysisPanel from "@/components/(playground)/request/components/trace-ai-analysis-panel";
 import getMessage from "@/constants/messages";
+import { sumHierarchyCost } from "@/helpers/client/trace";
 import { cn } from "@/lib/utils";
 
-type ViewMode = "tree" | "chat" | "analysis" | "timeline" | "graph";
+type ViewMode = "tree" | "chat" | "analysis" | "timeline" | "graph" | "subagents";
 type ViewModeLabelKey =
 	| "OBSERVABILITY_TREE"
 	| "OBSERVABILITY_CHAT"
 	| "TRACE_AI_TAB_TITLE"
 	| "OBSERVABILITY_TIMELINE"
-	| "OBSERVABILITY_GRAPH";
+	| "OBSERVABILITY_GRAPH"
+	| "OBSERVABILITY_SUBAGENTS";
 
 const VIEW_MODES: { key: ViewMode; labelKey: ViewModeLabelKey; icon: ReactNode }[] = [
 	{ key: "tree", labelKey: "OBSERVABILITY_TREE", icon: <GitBranch className="h-3.5 w-3.5" /> },
@@ -31,16 +34,8 @@ const VIEW_MODES: { key: ViewMode; labelKey: ViewModeLabelKey; icon: ReactNode }
 	{ key: "analysis", labelKey: "TRACE_AI_TAB_TITLE", icon: <Sparkles className="h-3.5 w-3.5" /> },
 	{ key: "timeline", labelKey: "OBSERVABILITY_TIMELINE", icon: <BarChart3 className="h-3.5 w-3.5" /> },
 	{ key: "graph", labelKey: "OBSERVABILITY_GRAPH", icon: <Network className="h-3.5 w-3.5" /> },
+	{ key: "subagents", labelKey: "OBSERVABILITY_SUBAGENTS", icon: <Bot className="h-3.5 w-3.5" /> },
 ];
-
-function sumCostRecursive(span: TraceHeirarchySpan): number {
-	const cost = span.Cost != null && span.Cost > 0 ? span.Cost : 0;
-	const childrenCost = (span.children || []).reduce(
-		(acc, child) => acc + sumCostRecursive(child),
-		0
-	);
-	return cost + childrenCost;
-}
 
 function countSpans(span?: TraceHeirarchySpan): number {
 	if (!span) return 0;
@@ -115,7 +110,7 @@ function SpanHierarchyExplorerInner({
 	const typedData = (data as { record?: TraceHeirarchySpan; err?: string }) || {};
 	const record = typedData.record;
 	const aggregateCost = useMemo(
-		() => (record ? sumCostRecursive(record) : 0),
+		() => (record ? sumHierarchyCost(record) : 0),
 		[record]
 	);
 	const spanCount = useMemo(() => countSpans(record), [record]);
@@ -144,7 +139,9 @@ function SpanHierarchyExplorerInner({
 			<div className="flex flex-wrap items-center gap-2 border-b border-stone-200 bg-stone-50 px-2 py-1.5 dark:border-stone-800 dark:bg-stone-900">
 				
 			<div className="flex rounded-md border border-stone-200 dark:border-stone-800 bg-white dark:bg-stone-950 p-0.5">
-					{VIEW_MODES.map((mode) => (
+					{VIEW_MODES.filter(
+						(mode) => mode.key !== "subagents" || isCodingAgent
+					).map((mode) => (
 						<button
 							key={mode.key}
 							onClick={() => {
@@ -214,6 +211,9 @@ function SpanHierarchyExplorerInner({
 						</div>
 					)}
 					{viewMode === "graph" && <NodeGraph record={record} />}
+					{viewMode === "subagents" && (
+						<SubagentBreakdownTable record={record} />
+					)}
 				</div>
 			)}
 			{aggregateCost > 0 && (

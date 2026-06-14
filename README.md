@@ -13,6 +13,7 @@ This repo bundles the OpenLIT CE source **with the local-Ollama-judge patches al
 - **Evaluate locally:** hallucination / bias / toxicity / relevance scoring by a local Ollama model.
 - **Analyze locally:** AI "Analyze trace" summaries by the same local model.
 - **Air-gapped by convention:** telemetry off, eval provider = `ollama`, OTLP on `localhost`.
+- **Verifiable cost:** **cache-aware** pricing (Anthropic cache reads ~0.1×, writes ~1.25× input — opus-4-8 etc.), plus a reconciler that confirms the store matches Claude Code's own per-turn `usage` to the cent.
 
 ## Repo layout
 ```
@@ -20,7 +21,11 @@ openlit/                      OpenLIT CE source (Apache-2.0), pinned + patched, 
 patches/                      the two source patches (to apply on a fresh upstream clone instead)
   0001-run-evaluation-add-ollama-judge.patch     # Evaluations path
   0002-chat-stream-add-ollama-provider.patch     # Chat / Trace-Analysis / prompt-improve path
-docs/                         implementation plan, options analysis, deployment notes
+tools/                        accuracy + pricing utilities (Python, stdlib-only)
+  reconcile_session.py        transcript (ground truth) <-> ClickHouse store: PASS/FAIL token + cost reconciliation
+  cc_pricing.py               pricing oracle (port of the CLI pricing.go) + self-test
+  fix_mojibake.py             repair UTF-8-double-encoded-as-CP1252 text
+docs/                         implementation plan, options analysis, deployment notes, trace-accuracy & pricing
 openlit-pinned-commit.txt     upstream commit the patches target
 ```
 
@@ -173,6 +178,19 @@ openlit coding install --vendor=claude-code
 1. The generated `~/.claude/plugins/.../hooks.json` writes Windows paths with single backslashes → **invalid JSON** → plugin won't load. Fix the command paths to **forward slashes + double quotes**, e.g. `"C:/Users/<you>/.openlit/bin/openlit.exe" coding hook …`.
 2. `openlit coding install` needs the `openlit` binary on **PATH** (open a new terminal, or prepend `%USERPROFILE%\.openlit\bin`).
 3. **Fully restart Claude Code** after install — hooks load at startup, so already-running sessions are never captured.
+
+---
+
+## Verify capture accuracy & cost (`tools/`)
+
+Confirm the stored numbers against **Claude Code's own ground truth** — the per-turn `usage` blocks in the session transcript (what `/context` is derived from):
+```bash
+python tools/reconcile_session.py --list                  # sessions in the store
+python tools/reconcile_session.py --session-id <uuid>     # PASS/FAIL reconciliation
+```
+It reads the raw transcript (main + subagents), recomputes the canonical 4-way token split (fresh / cache-read / cache-write / output) and cost via `cc_pricing.py`, pulls the ClickHouse store, and prints PASS/FAIL with the arithmetic expanded — token identity, **cost identity (a scan that flags any span re-priced cache-blind)**, coverage (dropped tail / duplicates), no-double-count, and tool dedupe. Read-only.
+
+> **Cache pricing note.** The CLI stamps a **cache-aware** cost at capture; the dashboard sums that, so everyday numbers are correct. The server *recompute* (the manual **"Recalculate"** button) is now also cache-aware and refuses to overwrite a captured cost. If you added a model in **Manage Models**, it only collected input+output rates — that's fine for Anthropic (the recompute falls back to published cache multipliers); see `docs/trace-accuracy-and-pricing.md` to add explicit per-model cache rates.
 
 ---
 

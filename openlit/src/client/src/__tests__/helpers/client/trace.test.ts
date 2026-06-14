@@ -13,8 +13,11 @@ import {
   ensureTraceRowShape,
   isSyntheticSpanId,
   SYNTHETIC_SPAN_ID_PREFIX,
+  sumHierarchyCost,
+  CODING_AGENT_SESSION_SPAN_NAME,
 } from '@/helpers/client/trace';
 import { TraceMapping } from '@/constants/traces';
+import { TraceHeirarchySpan } from '@/types/trace';
 
 describe('integerParser', () => {
   it('parses a string integer', () => {
@@ -626,5 +629,81 @@ describe('extractTextFromMessages (via normalizeTrace)', () => {
     } as any;
     const result = normalizeTrace(trace);
     expect(result.response).toBe('My response');
+  });
+});
+
+describe('sumHierarchyCost', () => {
+  // Build a coding-agent hierarchy that mirrors the real shape: a
+  // `coding_agent.session` ROOT carrying a whole-session aggregate cost,
+  // with the real per-turn leaves as children. The root cost must be
+  // excluded so it isn't double-counted (regression for the $22.22-vs-$2.07
+  // "Total cost" discrepancy).
+  const child = (
+    name: string,
+    cost: number,
+    children: TraceHeirarchySpan[] = []
+  ): TraceHeirarchySpan =>
+    ({ SpanId: name, SpanName: name, Duration: 0, Cost: cost, children } as TraceHeirarchySpan);
+
+  it('excludes the coding_agent.session root aggregate cost', () => {
+    const root = {
+      SpanId: 'root',
+      SpanName: CODING_AGENT_SESSION_SPAN_NAME,
+      Duration: 0,
+      Cost: 20.1487, // aggregate, priced as a single model — must be ignored
+      children: [
+        child('coding_agent.llm.turn', 1.58),
+        child('coding_agent.llm.turn', 0.49),
+        child('coding_agent.tool.call', 0),
+      ],
+    } as TraceHeirarchySpan;
+
+    // Sum of the turn leaves only, NOT root ($20.15) + leaves.
+    expect(sumHierarchyCost(root)).toBeCloseTo(2.07);
+  });
+
+  it('sums normally for non-coding-agent traces (no session root)', () => {
+    const root = {
+      SpanId: 'root',
+      SpanName: 'gen_ai.chat',
+      Duration: 0,
+      Cost: 0.5,
+      children: [child('gen_ai.chat', 0.25), child('gen_ai.chat', 0.25)],
+    } as TraceHeirarchySpan;
+
+    expect(sumHierarchyCost(root)).toBeCloseTo(1.0);
+  });
+
+  it('recurses through nested subagent turns under the session root', () => {
+    const root = {
+      SpanId: 'root',
+      SpanName: CODING_AGENT_SESSION_SPAN_NAME,
+      Duration: 0,
+      Cost: 999, // ignored
+      children: [
+        child('coding_agent.subagent', 0, [
+          child('coding_agent.llm.turn', 0.03),
+          child('coding_agent.llm.turn', 0.04),
+        ]),
+        child('coding_agent.llm.turn', 0.49),
+      ],
+    } as TraceHeirarchySpan;
+
+    expect(sumHierarchyCost(root)).toBeCloseTo(0.56);
+  });
+
+  it('treats missing/zero/negative Cost as 0', () => {
+    const root = {
+      SpanId: 'root',
+      SpanName: 'gen_ai.chat',
+      Duration: 0,
+      children: [
+        { SpanId: 'a', SpanName: 'gen_ai.chat', Duration: 0, children: [] } as TraceHeirarchySpan,
+        child('gen_ai.chat', -5),
+        child('gen_ai.chat', 0.2),
+      ],
+    } as TraceHeirarchySpan;
+
+    expect(sumHierarchyCost(root)).toBeCloseTo(0.2);
   });
 });

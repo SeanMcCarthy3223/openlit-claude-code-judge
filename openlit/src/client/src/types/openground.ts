@@ -35,6 +35,12 @@ export interface ModelMetadata {
 	contextWindow: number;
 	inputPricePerMToken: number; // Price per million tokens
 	outputPricePerMToken: number;
+	// Anthropic-style prompt caching has two extra rates that differ from input
+	// by ~12x. When unset (0/undefined) the cost layer falls back to the
+	// provider's published cache multipliers (Anthropic: read 0.1x, write 1.25x
+	// of input). See computeCostForTrace in lib/platform/pricing.
+	cacheReadPricePerMToken?: number; // cache-read rate (~0.1x input for Anthropic)
+	cacheCreationPricePerMToken?: number; // cache-write rate (~1.25x input for Anthropic)
 	capabilities?: string[]; // e.g., ["function-calling", "vision", "streaming"]
 }
 
@@ -78,6 +84,8 @@ export interface CustomModelInput {
 	contextWindow?: number;
 	inputPricePerMToken?: number;
 	outputPricePerMToken?: number;
+	cacheReadPricePerMToken?: number;
+	cacheCreationPricePerMToken?: number;
 	capabilities?: string[];
 }
 

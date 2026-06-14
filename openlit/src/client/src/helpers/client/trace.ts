@@ -359,6 +359,40 @@ export function getSpanCostFormatted(
 }
 
 /**
+ * Span name of the coding-agent session ROOT span.
+ *
+ * This span carries a *whole-session aggregate*: its `gen_ai.usage.*`
+ * totals are the sum of every `coding_agent.llm.turn` across all agents,
+ * and it is priced against a single `gen_ai.request.model`. Treat it as a
+ * grouping node — never a leaf — for cost rollups (see `sumHierarchyCost`).
+ */
+export const CODING_AGENT_SESSION_SPAN_NAME = "coding_agent.session";
+
+/**
+ * Recursively sum per-span `Cost` over a hierarchy, EXCLUDING the
+ * coding-agent session root's own cost.
+ *
+ * The `coding_agent.session` root is an aggregate duplicate: its cost
+ * already equals the sum of its turn leaves, and on a mixed-model run
+ * (e.g. an Opus orchestrator fanning out to Haiku subagents) it is
+ * mis-priced as a single model — so adding it on top of the per-turn
+ * leaves double-counts and inflates the total (e.g. $22.22 instead of the
+ * real ~$2). We skip the root's own cost while still summing its children
+ * (the real `coding_agent.llm.turn` leaves). Non-coding-agent traces have
+ * no such root, so they are summed normally.
+ */
+export function sumHierarchyCost(span: TraceHeirarchySpan): number {
+	const isAggregateRoot = span.SpanName === CODING_AGENT_SESSION_SPAN_NAME;
+	const ownCost =
+		!isAggregateRoot && span.Cost != null && span.Cost > 0 ? span.Cost : 0;
+	const childrenCost = (span.children || []).reduce(
+		(acc, child) => acc + sumHierarchyCost(child),
+		0
+	);
+	return ownCost + childrenCost;
+}
+
+/**
  * Get tooltip text for a hierarchy span (name, duration, cost).
  */
 export function getSpanTooltipText(span: TraceHeirarchySpan): string {
