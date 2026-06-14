@@ -4,6 +4,8 @@ Capture **Claude Code CLI** traces locally with [OpenLIT](https://github.com/ope
 
 This repo bundles the OpenLIT CE source **with the local-Ollama-judge patches already applied**, so you can clone and build it directly. The standout piece is the **Ollama judge setup for NVIDIA, AMD, and Apple Silicon** below.
 
+📋 **What's new:** see **[CHANGELOG.md](CHANGELOG.md)** for everything this fork adds over upstream.
+
 > **Why patches?** OpenLIT's built-in evaluations/analysis only ship cloud judge providers (OpenAI, Anthropic, …). Two tiny patches add an `ollama` provider pointing at `http://host.docker.internal:11434/v1`, so the judge runs locally and air-gapped.
 
 ---
@@ -26,6 +28,7 @@ tools/                        accuracy + pricing utilities (Python, stdlib-only)
   cc_pricing.py               pricing oracle (port of the CLI pricing.go) + self-test
   fix_mojibake.py             repair UTF-8-double-encoded-as-CP1252 text
 docs/                         implementation plan, options analysis, deployment notes, trace-accuracy & pricing
+CHANGELOG.md                  what this fork adds over upstream (patch notes)
 openlit-pinned-commit.txt     upstream commit the patches target
 ```
 
