@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
-import { BarChart3, Bot, DollarSign, GitBranch, MessageSquareText, Network, Sparkles } from "lucide-react";
+import { BarChart3, Bot, DollarSign, GitBranch, MessageSquareText, Network, PieChart, Sparkles } from "lucide-react";
 import useFetchWrapper from "@/utils/hooks/useFetchWrapper";
 import { TraceHeirarchySpan } from "@/types/trace";
 import {
@@ -14,19 +14,21 @@ import TimelineView from "@/components/(playground)/request/components/timeline-
 import NodeGraph from "@/components/(playground)/request/components/node-graph";
 import ChatView from "@/components/(playground)/request/components/chat-view";
 import SubagentBreakdownTable from "@/components/(playground)/request/components/subagent-breakdown";
+import BreakdownView from "@/components/(playground)/request/components/breakdown-view";
 import TraceAiAnalysisPanel from "@/components/(playground)/request/components/trace-ai-analysis-panel";
 import getMessage from "@/constants/messages";
 import { sumHierarchyCost } from "@/helpers/client/trace";
 import { cn } from "@/lib/utils";
 
-type ViewMode = "tree" | "chat" | "analysis" | "timeline" | "graph" | "subagents";
+type ViewMode = "tree" | "chat" | "analysis" | "timeline" | "graph" | "subagents" | "breakdown";
 type ViewModeLabelKey =
 	| "OBSERVABILITY_TREE"
 	| "OBSERVABILITY_CHAT"
 	| "TRACE_AI_TAB_TITLE"
 	| "OBSERVABILITY_TIMELINE"
 	| "OBSERVABILITY_GRAPH"
-	| "OBSERVABILITY_SUBAGENTS";
+	| "OBSERVABILITY_SUBAGENTS"
+	| "OBSERVABILITY_BREAKDOWN";
 
 const VIEW_MODES: { key: ViewMode; labelKey: ViewModeLabelKey; icon: ReactNode }[] = [
 	{ key: "tree", labelKey: "OBSERVABILITY_TREE", icon: <GitBranch className="h-3.5 w-3.5" /> },
@@ -35,6 +37,7 @@ const VIEW_MODES: { key: ViewMode; labelKey: ViewModeLabelKey; icon: ReactNode }
 	{ key: "timeline", labelKey: "OBSERVABILITY_TIMELINE", icon: <BarChart3 className="h-3.5 w-3.5" /> },
 	{ key: "graph", labelKey: "OBSERVABILITY_GRAPH", icon: <Network className="h-3.5 w-3.5" /> },
 	{ key: "subagents", labelKey: "OBSERVABILITY_SUBAGENTS", icon: <Bot className="h-3.5 w-3.5" /> },
+	{ key: "breakdown", labelKey: "OBSERVABILITY_BREAKDOWN", icon: <PieChart className="h-3.5 w-3.5" /> },
 ];
 
 function countSpans(span?: TraceHeirarchySpan): number {
@@ -214,6 +217,7 @@ function SpanHierarchyExplorerInner({
 					{viewMode === "subagents" && (
 						<SubagentBreakdownTable record={record} />
 					)}
+					{viewMode === "breakdown" && <BreakdownView record={record} />}
 				</div>
 			)}
 			{aggregateCost > 0 && (
