@@ -58,7 +58,7 @@ A real headless `claude -p` session produced spans in ClickHouse:
    - `/vault` → new secret, value = `ollama` (non-empty key is required; Ollama ignores it).
    - `/evaluations/settings` → Provider = **ollama** (if not listed, add via Manage Models; fallback = seed `default-models.ts` + rebuild), Model = **`qwen3-judge`** (see below), Secret = the vault secret. Enable auto + a `recurringTime` cron.
    - Run a **manual eval** on a captured trace and confirm a verdict appears.
-   - ✅ **qwen3 thinking-mode — already mitigated.** `qwen3:30b-a3b` emits `<think>…</think>` that would break the eval's JSON parsing. A non-thinking variant **`qwen3-judge`** has been **created and verified** (returns clean output, no `<think>`, even when the caller sends its own system message — exactly how OpenLIT calls it). **Use `qwen3-judge` as the eval model.** It was built with:
+   - ⚠️ **qwen3 thinking-mode.** `qwen3:30b-a3b` emits `<think>…</think>` that can break JSON parsing — use the non-thinking **`qwen3-judge`** variant as the eval model. **Note (learned later):** the Modelfile `SYSTEM "/no_think"` is *overridden* once a caller sends its own system message (as the eval/analysis prompts do), and Ollama's OpenAI-compat `/v1` endpoint ignores `think:false` / `chat_template_kwargs`, so on `/v1` the model can still think. The **AI trace-analysis** path was therefore moved to Ollama's **native `/api/chat`** with `think:false` + a JSON `format` schema (schema-valid output regardless of thinking). The eval path still relies on `qwen3-judge`; apply the same native-`/api/chat` treatment if you hit thinking-related parse issues there. It was built with:
      ```
      # Modelfile (already applied)
      FROM qwen3:30b-a3b
