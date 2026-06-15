@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -571,7 +572,11 @@ func outcomeFromReason(reason string, vcsDirty bool) string {
 		}
 		return semconv.CodingAgentSessionOutcomeAbandonedNoChange
 	case "clear":
-		return semconv.CodingAgentSessionOutcomeCancelled
+		// /clear is a graceful end of the conversation (the user resetting
+		// context), not an abort. Map it to completed so the SessionEnd
+		// reason=clear does not override the per-turn "completed" outcome
+		// (argMaxIf by Timestamp would otherwise surface "cancelled").
+		return semconv.CodingAgentSessionOutcomeCompleted
 	}
 	if vcsDirty {
 		return semconv.CodingAgentSessionOutcomeAbandonedWithChange
@@ -977,34 +982,89 @@ func tailTranscript(path string) (model string, cost float64, inTokens, outToken
 		CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
 		CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
 	}
+	// requestId / uuid live at the top level of each JSONL line, NOT
+	// inside `message` (see transcriptLine in transcript.go). We decode
+	// them here so we can coalesce streaming fragments the way the
+	// subagent rollup already does (coalesceSubagentTurns in
+	// subagents.go).
 	type turn struct {
-		Type    string `json:"type"`
-		Message struct {
+		Type      string `json:"type"`
+		RequestID string `json:"requestId"`
+		UUID      string `json:"uuid"`
+		Message   struct {
 			Model string `json:"model"`
 			Usage usage  `json:"usage"`
 		} `json:"message"`
 	}
 
-	var ti, to, cacheRead, cacheCreation int64
-	var lastModel string
+	// Claude Code writes several streaming assistant fragments per turn,
+	// each REPEATING the same cumulative usage for that turn's requestId.
+	// Summing every line therefore multiplies real usage by the fragment
+	// count (~2.4x in practice), which folded an inflated rollup onto the
+	// session-root span at SessionEnd. We instead keep the LAST fragment
+	// per requestId (usage is cumulative, so the last fragment is the
+	// authoritative total), preserving first-seen order so the summed
+	// result is deterministic. Fallback key is uuid for the rare line
+	// that carries usage without a requestId; lines whose usage is
+	// entirely zero are skipped so an empty / non-assistant line can't
+	// clobber a real fragment. This mirrors coalesceAssistants
+	// (transcript.go) and coalesceSubagentTurns (subagents.go) so the
+	// root rollup matches the sum of the child llm.turn leaves.
+	type acc struct {
+		usage usage
+		model string
+	}
+	dedup := make(map[string]*acc)
+	var order []string
 	for _, line := range lines {
 		var t turn
 		if err := json.Unmarshal(line, &t); err != nil {
 			continue
 		}
+		u := t.Message.Usage
+		if u.InputTokens == 0 && u.OutputTokens == 0 &&
+			u.CacheCreationInputTokens == 0 && u.CacheReadInputTokens == 0 {
+			// Non-usage line (user / tool_result / empty fragment); it
+			// must not overwrite a real fragment's cumulative usage.
+			continue
+		}
+		key := t.RequestID
+		if key == "" {
+			key = t.UUID
+		}
+		if key == "" {
+			// No coalescing key at all: treat as its own turn so we
+			// neither drop nor merge it. Use a unique synthetic key.
+			key = "\x00" + strconv.Itoa(len(order))
+		}
+		if a, ok := dedup[key]; ok {
+			a.usage = u // last-wins: cumulative, last fragment is total
+			if t.Message.Model != "" {
+				a.model = t.Message.Model
+			}
+		} else {
+			dedup[key] = &acc{usage: u, model: t.Message.Model}
+			order = append(order, key)
+		}
+	}
+
+	var ti, to, cacheRead, cacheCreation int64
+	var lastModel string
+	for _, key := range order {
+		a := dedup[key]
 		// Anthropic transcript reports cache creation + cache read as
 		// separate counters; "fresh" input is the standard input_tokens.
 		// The OTel field gen_ai.usage.input_tokens should equal total
 		// distinct input the model saw, so we sum them.
-		fresh := t.Message.Usage.InputTokens
-		creation := t.Message.Usage.CacheCreationInputTokens
-		read := t.Message.Usage.CacheReadInputTokens
+		fresh := a.usage.InputTokens
+		creation := a.usage.CacheCreationInputTokens
+		read := a.usage.CacheReadInputTokens
 		ti += fresh + creation + read
 		cacheRead += read
 		cacheCreation += creation
-		to += t.Message.Usage.OutputTokens
-		if t.Message.Model != "" {
-			lastModel = t.Message.Model
+		to += a.usage.OutputTokens
+		if a.model != "" {
+			lastModel = a.model
 		}
 	}
 	rate := pricing.Lookup(lastModel)

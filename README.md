@@ -128,7 +128,7 @@ docker compose -p openlit -f dev-docker-compose.yml exec -T openlit \
 ```bash
 ollama pull qwen3:30b-a3b
 ```
-**Qwen3 emits `<think>…</think>` reasoning that breaks the eval/analysis JSON parsing.** Create a non-thinking judge variant (shares the same weights — no extra disk):
+**Qwen3 emits `<think>…</think>` reasoning that can break JSON parsing.** Create a non-thinking judge variant (shares the same weights — no extra disk):
 ```
 # Modelfile
 FROM qwen3:30b-a3b
@@ -137,7 +137,11 @@ SYSTEM "/no_think"
 ```bash
 ollama create qwen3-judge -f Modelfile      # use `qwen3-judge` as the judge model
 ```
-(Non-thinking models such as `qwen2.5:*` / `mistral-small` don't need this.) Verify GPU placement:
+(Non-thinking models such as `qwen2.5:*` / `mistral-small` don't need this.)
+
+> **AI trace analysis no longer depends on this.** The *Analyze trace* path calls Ollama's **native `/api/chat` with `think:false` + a JSON `format` schema**, so it returns schema-valid findings even when a model would otherwise emit `<think>` (qwen3's `/no_think` is ignored on the OpenAI-compat `/v1` endpoint once the analysis sends its own system prompt). The `qwen3-judge` variant is still recommended — it keeps the **Evaluations** path clean and avoids wasted reasoning tokens.
+
+Verify GPU placement:
 ```bash
 ollama run qwen3-judge "hi"
 ollama ps        # PROCESSOR should read 100% GPU

@@ -633,7 +633,7 @@ export default function TraceImprovementView({
 		setSteps([]);
 
 		const abortController = new AbortController();
-		const timeoutId = setTimeout(() => abortController.abort(), 120_000);
+		const timeoutId = setTimeout(() => abortController.abort(), 300_000);
 
 		try {
 			const scopeParam = scope === "span" ? "?scope=span" : "";

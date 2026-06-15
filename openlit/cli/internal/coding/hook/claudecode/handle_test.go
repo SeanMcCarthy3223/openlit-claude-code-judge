@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -239,5 +241,85 @@ func TestClaudeSessionDurationCachedAcrossInvocations(t *testing.T) {
 	}
 	if dur := ended.EndedAt.Sub(ended.StartedAt); dur < 30*time.Second {
 		t.Errorf("ended session duration = %s, want >= 30s (cache should have rewound start)", dur)
+	}
+}
+
+// TestTailTranscriptCoalescesStreamingFragments proves the SessionEnd
+// root-rollup fix: N streaming assistant fragments that all repeat the
+// SAME cumulative usage for one requestId must roll up to 1x usage, not
+// Nx. Claude Code writes several fragments per turn (each echoing the
+// running cumulative usage); before the fix tailTranscript summed every
+// line, multiplying real usage by the fragment count (~2.4x) and folding
+// that inflated total onto the coding_agent.session root span — which the
+// UI prefers over the (correct, coalesced) child llm.turn sum. The fix
+// keeps the last fragment per requestId, mirroring coalesceSubagentTurns.
+func TestTailTranscriptCoalescesStreamingFragments(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "transcript.jsonl")
+
+	// One assistant fragment line. Each fragment of a turn repeats the
+	// cumulative usage, exactly like the real Claude Code transcript.
+	frag := func(requestID, model string, in, out, cacheCreate, cacheRead int64) string {
+		b, err := json.Marshal(map[string]any{
+			"type":      "assistant",
+			"requestId": requestID,
+			"message": map[string]any{
+				"model": model,
+				"usage": map[string]any{
+					"input_tokens":                in,
+					"output_tokens":               out,
+					"cache_creation_input_tokens": cacheCreate,
+					"cache_read_input_tokens":     cacheRead,
+				},
+			},
+		})
+		if err != nil {
+			t.Fatalf("marshal fragment: %v", err)
+		}
+		return string(b)
+	}
+
+	// Turn 1: requestId req-1, 3 fragments, cumulative usage repeated.
+	// Turn 2: requestId req-2, 2 fragments, cumulative usage repeated.
+	// A trailing user line (no usage) must NOT clobber anything.
+	lines := []string{
+		frag("req-1", "claude-opus-4-8", 100, 10, 40, 5),
+		frag("req-1", "claude-opus-4-8", 100, 10, 40, 5),
+		frag("req-1", "claude-opus-4-8", 100, 10, 40, 5),
+		frag("req-2", "claude-opus-4-8", 200, 20, 80, 5),
+		frag("req-2", "claude-opus-4-8", 200, 20, 80, 5),
+		`{"type":"user","message":{"content":"hi"}}`,
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+
+	model, cost, in0, out0, total := tailTranscript(path)
+
+	// EXPECTED = one count per requestId (NOT one per fragment):
+	//   in  = (100+40+5) + (200+80+5) = 145 + 285 = 430
+	//   out = 10 + 20 = 30
+	const wantIn = int64(430)
+	const wantOut = int64(30)
+	if in0 != wantIn {
+		t.Errorf("input tokens = %d, want %d (Nx-inflation regression: summed fragments instead of coalescing)", in0, wantIn)
+	}
+	if out0 != wantOut {
+		t.Errorf("output tokens = %d, want %d", out0, wantOut)
+	}
+	if total != wantIn+wantOut {
+		t.Errorf("total tokens = %d, want %d", total, wantIn+wantOut)
+	}
+	if model != "claude-opus-4-8" {
+		t.Errorf("model = %q, want claude-opus-4-8", model)
+	}
+	if cost <= 0 {
+		t.Errorf("cost = %v, want > 0", cost)
+	}
+
+	// Guard rail: if a future refactor reverts to summing, in0 would be
+	// 3*145 + 2*285 = 435 + 570 = 1005. Assert we are nowhere near it.
+	if in0 >= 1000 {
+		t.Errorf("input tokens %d looks like summed fragments (>=1000); coalescing is broken", in0)
 	}
 }

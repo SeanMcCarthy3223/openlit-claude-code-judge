@@ -15,6 +15,13 @@ import {
 } from "@/types/trace-analysis";
 import Sanitizer from "@/utils/sanitizer";
 
+// The coding_agent.session root span is a ROLLUP: at SessionEnd the CLI
+// folds the whole session's tokens/cost onto it (= the sum of the
+// llm.turn leaves). Counting it alongside its children double-counts
+// (root + leaves = 2x), so trace-metric/cost rollups must exclude it —
+// the same leaves-only rule the Sessions list and dashboards use.
+const CODING_AGENT_SESSION_SPAN_NAME = "coding_agent.session";
+
 type ImprovementSpanSummary = {
 	traceId?: string;
 	spanId: string;
@@ -801,7 +808,10 @@ function topRepeatedEntries(map: Map<string, string[]>, limit = 5) {
 		.filter(([, spanIds]) => spanIds.length > 1)
 		.sort((a, b) => b[1].length - a[1].length)
 		.slice(0, limit)
-		.map(([key, spanIds]) => ({ key, count: spanIds.length, spanIds }));
+		// Cap the listed spanIds (keep the true count) so these arrays can't
+		// balloon the per-dimension metrics past the model's context window
+		// on large traces — the prompt overflowed and truncated otherwise.
+		.map(([key, spanIds]) => ({ key, count: spanIds.length, spanIds: spanIds.slice(0, 6) }));
 }
 
 function siblingRetrySequences(span: ImprovementSpanSummary): Array<{ reason: string; spanIds: string[] }> {
@@ -861,21 +871,28 @@ function extractTraceMetrics(summary: ImprovementSpanSummary): TraceAnalysisMetr
 
 	function visit(span: ImprovementSpanSummary, depth: number) {
 		maxDepth = Math.max(maxDepth, depth);
-		if (span.role === "llm") llmCallCount++;
-		if (span.role === "tool") toolCallCount++;
-		if (span.role === "retrieval") retrievalCallCount++;
-		if (span.role === "embedding") embeddingCallCount++;
-		if (span.role === "database") databaseCallCount++;
-		if (span.role === "http") httpCallCount++;
-		if (span.statusCode === "STATUS_CODE_ERROR" || Boolean(span.error)) errorCount++;
+		// The coding_agent.session rollup span folds the children's
+		// tokens/cost; counting it double-counts (root + leaves = 2x). Skip
+		// its usage/cost/call contribution below — but NOT duration (the
+		// rollup carries the real session wall-clock; its children report 0).
+		const isRollup = span.spanName === CODING_AGENT_SESSION_SPAN_NAME;
+		if (!isRollup) {
+			if (span.role === "llm") llmCallCount++;
+			if (span.role === "tool") toolCallCount++;
+			if (span.role === "retrieval") retrievalCallCount++;
+			if (span.role === "embedding") embeddingCallCount++;
+			if (span.role === "database") databaseCallCount++;
+			if (span.role === "http") httpCallCount++;
+			if (span.statusCode === "STATUS_CODE_ERROR" || Boolean(span.error)) errorCount++;
+		}
 
-		const input = span.promptTokens || 0;
-		const output = span.completionTokens || 0;
-		const total = span.totalTokens || input + output;
-		const cacheRead = span.cacheReadTokens || 0;
-		const cacheCreation = span.cacheCreationTokens || 0;
-		const reasoning = span.reasoningTokens || 0;
-		const cost = span.cost || 0;
+		const input = isRollup ? 0 : span.promptTokens || 0;
+		const output = isRollup ? 0 : span.completionTokens || 0;
+		const total = isRollup ? 0 : span.totalTokens || input + output;
+		const cacheRead = isRollup ? 0 : span.cacheReadTokens || 0;
+		const cacheCreation = isRollup ? 0 : span.cacheCreationTokens || 0;
+		const reasoning = isRollup ? 0 : span.reasoningTokens || 0;
+		const cost = isRollup ? 0 : span.cost || 0;
 		const duration = span.durationMs || 0;
 
 		totalInputTokens += input;
@@ -1192,6 +1209,66 @@ function metricsForDimension(metrics: TraceAnalysisMetrics, dimension: TraceAnal
 	};
 }
 
+// The full focused trace tree can be enormous for large coding-agent
+// runs (a multi-hour session distilled to >1 MB of JSON). That overflows
+// a local judge's context window (e.g. Ollama defaults to 16k tokens):
+// the prompt is silently truncated and the model returns empty / non-JSON
+// output, so every dimension "could not be parsed". We cap the
+// per-dimension tree to a char budget — if it fits, send the full tree;
+// otherwise send a flat list of the highest-signal spans (errors first,
+// then cost / tokens / duration) up to the budget, so the model still
+// sees the most relevant evidence with room to answer. The deterministic
+// metrics block already carries the authoritative totals.
+const FOCUSED_TREE_CHAR_BUDGET = 16000;
+
+function spanRelevanceScore(span: ImprovementSpanSummary): number {
+	let score = 0;
+	if (span.statusCode === "STATUS_CODE_ERROR" || span.error) score += 1e12;
+	score += (span.cost || 0) * 1e6;
+	score += span.totalTokens || (span.promptTokens || 0) + (span.completionTokens || 0);
+	score += span.durationMs || 0;
+	return score;
+}
+
+function projectSpanFlat(
+	span: ImprovementSpanSummary,
+	dimension: TraceAnalysisDimension
+): Record<string, unknown> {
+	// Reuse the per-dimension field projection but drop the recursive
+	// children so each span serializes as a single flat entry.
+	const projected = spanForDimension({ ...span, children: [] }, dimension);
+	delete (projected as any).children;
+	return projected;
+}
+
+function buildBoundedFocusedTree(
+	summary: ImprovementSpanSummary,
+	dimension: TraceAnalysisDimension
+): { tree: unknown; truncated: boolean; includedSpans: number; totalSpans: number } {
+	const fullTree = spanForDimension(summary, dimension);
+	const totalSpans = flattenSummary(summary).length;
+	if (JSON.stringify(fullTree).length <= FOCUSED_TREE_CHAR_BUDGET) {
+		return { tree: fullTree, truncated: false, includedSpans: totalSpans, totalSpans };
+	}
+	const ranked = flattenSummary(summary)
+		.filter((span) => span.spanName !== CODING_AGENT_SESSION_SPAN_NAME)
+		.sort((a, b) => spanRelevanceScore(b) - spanRelevanceScore(a));
+	const kept: Record<string, unknown>[] = [];
+	let size = 0;
+	for (const span of ranked) {
+		const entry = projectSpanFlat(span, dimension);
+		const entryLength = JSON.stringify(entry).length + 1;
+		if (kept.length > 0 && size + entryLength > FOCUSED_TREE_CHAR_BUDGET) break;
+		kept.push(entry);
+		size += entryLength;
+	}
+	return { tree: kept, truncated: true, includedSpans: kept.length, totalSpans };
+}
+
+function focusedTreeJson(summary: ImprovementSpanSummary, dimension: TraceAnalysisDimension): string {
+	return JSON.stringify(buildBoundedFocusedTree(summary, dimension).tree, null, 2);
+}
+
 function buildDimensionSystemPrompt(dimension: TraceAnalysisDimension) {
 	return `You are analyzing one dimension of a single OpenTelemetry trace from an LLM application.
 
@@ -1241,10 +1318,12 @@ ${JSON.stringify({
 
 Focused trace tree:
 \`\`\`json
-${JSON.stringify(spanForDimension(summary, dimension), null, 2)}
+${focusedTreeJson(summary, dimension)}
 \`\`\`
 
-Return strict JSON: {"summary": string, "findings": Finding[]}.`;
+Return strict JSON: {"summary": string, "findings": Finding[]}.
+
+/no_think`;
 }
 
 function buildDimensionGraderSystemPrompt(dimension: TraceAnalysisDimension) {
@@ -1307,10 +1386,12 @@ ${JSON.stringify({
 
 Focused trace tree:
 \`\`\`json
-${JSON.stringify(spanForDimension(summary, dimension), null, 2)}
+${focusedTreeJson(summary, dimension)}
 \`\`\`
 
-Return the improved final JSON only: {"summary": string, "findings": Finding[]}.`;
+Return the improved final JSON only: {"summary": string, "findings": Finding[]}.
+
+/no_think`;
 }
 
 function estimateCost(promptTokens: number, completionTokens: number) {
@@ -1325,19 +1406,25 @@ function calculateTotals(root: TraceHeirarchySpan) {
 
 	function visit(span: TraceHeirarchySpan) {
 		const attrs = span.SpanAttributes || {};
-		totalTokens += readFirstNumber(attrs, [
-			"gen_ai.usage.total_tokens",
-			"gen_ai.client.token.usage",
-			"llm.usage.total_tokens",
-			"total_tokens",
-			"claude_code.usage.total_tokens",
-		]) || 0;
-		totalCost += span.Cost || readFirstNumber(attrs, [
-			"gen_ai.usage.cost",
-			"llm.usage.cost",
-			"cost",
-			"claude_code.cost",
-		]) || 0;
+		// Exclude the coding_agent.session rollup span — it folds the
+		// children's tokens/cost, so counting it double-counts (root +
+		// leaves = 2x). Duration is kept: the rollup carries the real
+		// session wall-clock while its point-marker children report 0.
+		if (span.SpanName !== CODING_AGENT_SESSION_SPAN_NAME) {
+			totalTokens += readFirstNumber(attrs, [
+				"gen_ai.usage.total_tokens",
+				"gen_ai.client.token.usage",
+				"llm.usage.total_tokens",
+				"total_tokens",
+				"claude_code.usage.total_tokens",
+			]) || 0;
+			totalCost += span.Cost || readFirstNumber(attrs, [
+				"gen_ai.usage.cost",
+				"llm.usage.cost",
+				"cost",
+				"claude_code.cost",
+			]) || 0;
+		}
 		durationMs += spanDurationMs(span);
 		(span.children || []).forEach(visit);
 	}
@@ -1382,12 +1469,26 @@ function parseDimensionAnalysis(
 	dimension: TraceAnalysisDimension,
 	root: TraceHeirarchySpan
 ): { summary: string; findings: TraceAnalysisFinding[] } {
-	const jsonText = rawText
+	const cleaned = rawText
+		// Defensive: strip <think>...</think> blocks some models emit even
+		// when asked for JSON-only (e.g. reasoning models), which would
+		// otherwise break JSON.parse.
+		.replace(/<think>[\s\S]*?<\/think>/gi, "")
 		.trim()
 		.replace(/^```json\s*/i, "")
 		.replace(/^```\s*/i, "")
 		.replace(/```$/i, "")
 		.trim();
+	// Fallback: if the model wrapped the JSON object in prose, parse the
+	// first {...} span instead of giving up. Only when the text does NOT
+	// already start as JSON, so a valid top-level array/object is left
+	// untouched.
+	const firstBrace = cleaned.indexOf("{");
+	const lastBrace = cleaned.lastIndexOf("}");
+	const jsonText =
+		!cleaned.startsWith("{") && !cleaned.startsWith("[") && firstBrace >= 0 && lastBrace > firstBrace
+			? cleaned.slice(firstBrace, lastBrace + 1)
+			: cleaned;
 	try {
 		const parsed = JSON.parse(jsonText);
 		const findingsSource = Array.isArray(parsed)
@@ -1428,19 +1529,135 @@ type DimensionGenerationStats = {
 	cost: number;
 };
 
-async function streamJsonText({
-	model,
+// JSON schema for a single dimension's analysis output. Used to force
+// structured output from local models that otherwise emit prose (every
+// dimension then "could not be parsed"). Mirrors the
+// {summary, findings: Finding[]} contract; optional finding fields are
+// allowed (no additionalProperties:false) so the model may still populate
+// suggested_fix / estimated_savings, which normalizeFinding validates.
+const DIMENSION_JSON_SCHEMA = {
+	type: "object",
+	properties: {
+		summary: { type: "string" },
+		findings: {
+			type: "array",
+			items: {
+				type: "object",
+				properties: {
+					id: { type: "string" },
+					severity: { type: "string", enum: ["info", "minor", "major", "critical"] },
+					summary: { type: "string" },
+					detail: { type: "string" },
+					span_refs: { type: "array", items: { type: "string" } },
+					suggested_fix: { type: "string" },
+					estimated_savings: {
+						type: "object",
+						properties: { tokens: { type: "number" }, usd: { type: "number" } },
+					},
+				},
+				required: ["severity", "summary", "detail", "span_refs"],
+			},
+		},
+	},
+	required: ["summary", "findings"],
+} as const;
+
+// Ollama's OpenAI-compatible endpoint (/v1) ignores `think:false` and
+// `chat_template_kwargs`, so a reasoning model like qwen3 keeps streaming a
+// <think> channel that can consume the whole token budget before any JSON
+// is emitted. The NATIVE /api/chat endpoint honors `think:false` (genuinely
+// disables thinking — ~6x faster, no runaway) and `format:<schema>` (forces
+// schema-valid JSON), so we call it directly for the local judge instead of
+// routing through ai-sdk. Derived from OLLAMA_BASE_URL (strip the /v1
+// OpenAI-compat suffix) or overridden via OLLAMA_NATIVE_URL.
+function ollamaNativeChatUrl(): string {
+	const explicit = process.env.OLLAMA_NATIVE_URL;
+	if (explicit) return explicit;
+	const base = (process.env.OLLAMA_BASE_URL ?? "http://host.docker.internal:11434/v1")
+		.replace(/\/+$/, "")
+		.replace(/\/v1$/, "");
+	return `${base}/api/chat`;
+}
+
+async function ollamaNativeJsonChat({
+	modelName,
 	system,
 	prompt,
 	maxOutputTokens,
+	jsonSchema,
 	onUsage,
 }: {
-	model: Parameters<typeof streamText>[0]["model"];
+	modelName: string;
 	system: string;
 	prompt: string;
 	maxOutputTokens: number;
+	jsonSchema: unknown;
+	onUsage: (stats: DimensionGenerationStats) => void;
+}): Promise<string> {
+	const res = await fetch(ollamaNativeChatUrl(), {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({
+			model: modelName,
+			stream: false,
+			think: false,
+			format: jsonSchema,
+			options: { temperature: 0, num_predict: maxOutputTokens },
+			messages: [
+				{ role: "system", content: system },
+				{ role: "user", content: prompt },
+			],
+		}),
+	});
+	if (!res.ok) {
+		throw new Error(`Ollama native chat failed: ${res.status} ${res.statusText}`);
+	}
+	const data: any = await res.json();
+	const promptTokens = Number(data?.prompt_eval_count) || 0;
+	const completionTokens = Number(data?.eval_count) || 0;
+	onUsage({
+		promptTokens,
+		completionTokens,
+		cost: estimateCost(promptTokens, completionTokens),
+	});
+	const content = data?.message?.content;
+	if (typeof content === "string") return content;
+	return content ? JSON.stringify(content) : "";
+}
+
+async function streamJsonText({
+	provider,
+	model,
+	modelName,
+	system,
+	prompt,
+	maxOutputTokens,
+	jsonSchema,
+	onUsage,
+}: {
+	provider: string;
+	model: Parameters<typeof streamText>[0]["model"];
+	modelName: string;
+	system: string;
+	prompt: string;
+	maxOutputTokens: number;
+	jsonSchema: unknown;
 	onUsage: (stats: DimensionGenerationStats) => void;
 }) {
+	// Local judge (Ollama): force schema-valid JSON and disable thinking via
+	// the native endpoint. The ai-sdk OpenAI-compat path cannot disable
+	// qwen3's thinking, which intermittently breaks JSON parsing.
+	if (provider === "ollama") {
+		return ollamaNativeJsonChat({
+			modelName,
+			system,
+			prompt,
+			maxOutputTokens,
+			jsonSchema,
+			onUsage,
+		});
+	}
+
 	let text = "";
 	let finishResolve: () => void;
 	const finishPromise = new Promise<void>((resolve) => {
@@ -1465,12 +1682,16 @@ async function streamJsonText({
 		},
 	});
 
+	let reasoning = "";
 	for await (const part of result.fullStream) {
-		const textDelta =
-			part.type === "text-delta"
-				? ((part as any).text ?? (part as any).delta ?? "")
-				: "";
-		if (textDelta) text += textDelta;
+		if (part.type === "text-delta") {
+			text += (part as any).text ?? (part as any).delta ?? "";
+		} else if ((part.type as string) === "reasoning-delta" || (part.type as string) === "reasoning") {
+			// Some models (e.g. qwen3 thinking mode) stream their answer in a
+			// reasoning channel instead of as text. Capture it as a fallback so
+			// parseDimensionAnalysis can still extract the JSON object from it.
+			reasoning += (part as any).text ?? (part as any).delta ?? "";
+		}
 	}
 
 	await Promise.race([
@@ -1478,7 +1699,7 @@ async function streamJsonText({
 		new Promise((resolve) => setTimeout(resolve, 5000)),
 	]);
 
-	return text;
+	return text.trim() ? text : reasoning;
 }
 
 function buildAggregatedSummary(dimensionSummaries: Partial<Record<TraceAnalysisDimension, string>>, analysis: TraceAnalysis) {
@@ -1534,7 +1755,14 @@ function createStreamEvent(
 	encoder: TextEncoder,
 	event: Record<string, unknown>
 ) {
-	controller.enqueue(encoder.encode(`${JSON.stringify(event)}\n`));
+	try {
+		controller.enqueue(encoder.encode(`${JSON.stringify(event)}\n`));
+	} catch {
+		// The client may have disconnected (navigated away, or hit the request
+		// timeout), which closes the stream. Swallow late writes so the
+		// server-side analysis still runs to completion and SAVES the run —
+		// the saved result is then served on the next GET / page refresh.
+	}
 }
 
 function createDebugEvent(
@@ -1715,6 +1943,10 @@ export async function streamTraceImprovementAnalysis(
 					let dimensionText = "";
 					let dimensionStats = { promptTokens: 0, completionTokens: 0, cost: 0 };
 					dimensionText = await streamJsonText({
+						provider: config.provider,
+						model: modelInstance,
+						modelName: config.model,
+						jsonSchema: DIMENSION_JSON_SCHEMA,
 						system: buildDimensionSystemPrompt(dimension),
 						prompt: buildDimensionUserPrompt({
 							spanId,
@@ -1723,8 +1955,7 @@ export async function streamTraceImprovementAnalysis(
 							metrics,
 							ruleContext,
 						}),
-						maxOutputTokens: 900,
-						model: modelInstance,
+						maxOutputTokens: 1500,
 						onUsage: (stats) => {
 							dimensionStats = stats;
 							addFinishStats(stats);
@@ -1761,59 +1992,71 @@ export async function streamTraceImprovementAnalysis(
 						cost: dimensionStats.cost,
 						summaryPreview: previewValue(dimensionAnalysis.summary, 180),
 					});
-					createStreamEvent(controller, encoder, {
-						type: "step",
-						status: "active",
-						label: `Grading ${DIMENSION_LABELS[dimension]}`,
-						detail: "Checking evidence, removing weak findings, and tightening recommendations",
-					});
-
 					let gradedAnalysis = dimensionAnalysis;
 					let graderText = "";
 					let graderStats = { promptTokens: 0, completionTokens: 0, cost: 0 };
-					try {
-						graderText = await streamJsonText({
-							model: modelInstance,
-							system: buildDimensionGraderSystemPrompt(dimension),
-							prompt: buildDimensionGraderUserPrompt({
-								spanId,
-								dimension,
-								summary,
-								metrics,
-								ruleContext,
-								firstPass: dimensionAnalysis,
-							}),
-							maxOutputTokens: 1000,
-							onUsage: (stats) => {
-								graderStats = stats;
-								addFinishStats(stats);
-							},
+
+					// Grader pass runs for every provider, including the local
+					// judge (Ollama) — for Ollama it goes through the same native
+					// JSON-enforced path as the first pass (think:false + format),
+					// so it stays parseable while refining and pruning findings.
+					// Adds a second model call per dimension (≈2x the per-run
+					// Ollama calls); with think:false each call is fast.
+					const runGraderPass = true;
+					if (runGraderPass) {
+						createStreamEvent(controller, encoder, {
+							type: "step",
+							status: "active",
+							label: `Grading ${DIMENSION_LABELS[dimension]}`,
+							detail: "Checking evidence, removing weak findings, and tightening recommendations",
 						});
-						gradedAnalysis = parseDimensionAnalysis(
-							graderText,
-							dimension,
-							analysisRoot
-						);
-						if (gradedAnalysis.summary === "This dimension could not be parsed.") {
-							logTraceAnalysisError("dimension_grader_parse_failed_fallback", "Using first-pass analysis", {
+						try {
+							graderText = await streamJsonText({
+								provider: config.provider,
+								model: modelInstance,
+								modelName: config.model,
+								jsonSchema: DIMENSION_JSON_SCHEMA,
+								system: buildDimensionGraderSystemPrompt(dimension),
+								prompt: buildDimensionGraderUserPrompt({
+									spanId,
+									dimension,
+									summary,
+									metrics,
+									ruleContext,
+									firstPass: dimensionAnalysis,
+								}),
+								maxOutputTokens: 1500,
+								onUsage: (stats) => {
+									graderStats = stats;
+									addFinishStats(stats);
+								},
+							});
+							gradedAnalysis = parseDimensionAnalysis(
+								graderText,
+								dimension,
+								analysisRoot
+							);
+							if (gradedAnalysis.summary === "This dimension could not be parsed.") {
+								logTraceAnalysisError("dimension_grader_parse_failed_fallback", "Using first-pass analysis", {
+									spanId,
+									scope,
+									rootSpanId,
+									runNumber,
+									dimension,
+									rawChars: graderText.length,
+									rawPreview: previewValue(graderText, 300),
+								});
+								gradedAnalysis = dimensionAnalysis;
+							}
+						} catch (error) {
+							logTraceAnalysisError("dimension_grader_failed", error, {
 								spanId,
 								scope,
 								rootSpanId,
 								runNumber,
 								dimension,
-								rawChars: graderText.length,
-								rawPreview: previewValue(graderText, 300),
 							});
-							gradedAnalysis = dimensionAnalysis;
 						}
-					} catch (error) {
-						logTraceAnalysisError("dimension_grader_failed", error, {
-							spanId,
-							scope,
-							rootSpanId,
-							runNumber,
-							dimension,
-						});
 					}
 
 					analysis[dimension] = gradedAnalysis.findings;
@@ -1850,11 +2093,13 @@ export async function streamTraceImprovementAnalysis(
 						dimension,
 						findings: analysis[dimension],
 					});
-					createStreamEvent(controller, encoder, {
-						type: "step",
-						status: "complete",
-						label: `Grading ${DIMENSION_LABELS[dimension]}`,
-					});
+					if (runGraderPass) {
+						createStreamEvent(controller, encoder, {
+							type: "step",
+							status: "complete",
+							label: `Grading ${DIMENSION_LABELS[dimension]}`,
+						});
+					}
 					createStreamEvent(controller, encoder, {
 						type: "step",
 						status: "complete",

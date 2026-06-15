@@ -20,3 +20,8 @@ logs/
 **certs/index.txt
 **.csr
 sdk/typescript-test/
+
+# Local dev artifacts (added 2026-06-14)
+.omc/
+openlit-new.exe
+*.bak-pre-*
