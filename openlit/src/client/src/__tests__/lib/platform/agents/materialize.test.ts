@@ -402,3 +402,48 @@ describe("materializeAgents — workload_key dedup", () => {
 		expect(ctrlQuery!).toMatch(/latest\.llm_providers\s+AS\s+llm_providers/);
 	});
 });
+
+describe("materializeAgents — coding-agent cost rollup", () => {
+	// Regression: the hub "Coding Agents" Total Cost card read ~2x the
+	// per-agent detail page because discoverCodingAgents summed
+	// gen_ai.usage.cost across ALL spans. The session-root span
+	// ('coding_agent.session') carries the rolled-up whole-session
+	// gen_ai.usage.cost in addition to the per-turn child spans, so the
+	// naive sum stacked the session total on top of its own children.
+	// The fix excludes the root span from the sum, matching the Sessions
+	// list (queries.ts SESSION_BASE_COLUMNS) and the dashboard
+	// "Total cost (USD)" widget.
+	it("excludes the session-root span from the gen_ai.usage.cost sum so cost isn't double-counted", async () => {
+		const queries: string[] = [];
+		mockedDC.mockImplementation(async (config: any, op: string) => {
+			if (op === "query") {
+				queries.push(String(config.query));
+				return { data: [] } as any;
+			}
+			return { data: [] } as any;
+		});
+
+		await materializeAgents();
+
+		// Positional indexing across the three concurrent discovery
+		// queries (SDK / coding / controller) is unstable — locate the
+		// coding-agent discovery query by an attribute unique to it.
+		const codingQuery = queries.find((q) =>
+			q.includes("coding_agent.session.cost_usd")
+		);
+		expect(codingQuery).toBeDefined();
+
+		// The per-turn cost sum must be guarded so the rolled-up total on
+		// the 'coding_agent.session' root span is not added on top of the
+		// per-turn children.
+		expect(codingQuery!).toMatch(
+			/sumOrNull\(\s*if\(\s*SpanName\s*!=\s*'coding_agent\.session',\s*toFloat64OrZero\(SpanAttributes\['gen_ai\.usage\.cost'\]\)/
+		);
+
+		// The old, double-counting form summed gen_ai.usage.cost across
+		// every span with no root-span guard. It must be gone.
+		expect(codingQuery!).not.toMatch(
+			/sumOrNull\(\s*toFloat64OrZero\(SpanAttributes\['gen_ai\.usage\.cost'\]\)\s*\)/
+		);
+	});
+});

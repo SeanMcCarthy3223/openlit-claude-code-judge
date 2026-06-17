@@ -2,6 +2,14 @@
 
 What this fork adds on top of upstream [OpenLIT CE](https://github.com/openlit/openlit) — a local, air-gapped Claude Code observability + LLM-judge setup. Newest first.
 
+## 2026-06-16
+
+### Added
+- **Idle / completed session states** — the coding-agent Sessions list no longer latches the blue "running" pill forever on sessions that never recorded an end-of-session outcome (closing VS Code, a crash, or starting a new chat skips the graceful end). It now ages each session by its last activity: `running` (< 30 min), `idle` (30 min–48 h), then `completed` (≥ 48 h). Applies only when there's no real outcome (a genuine verdict still wins), self-ages via a 60-second ticking clock with no hydration mismatch, and needs no schema or data change. Adds a `session-liveness` helper with 9 unit tests pinning the boundaries.
+
+### Fixed
+- **Coding Agents hub "Total Cost" double-count** — the `/agents` Coding Agents card summed `gen_ai.usage.cost` across *all* spans including the `coding_agent.session` rollup, so it read ~2× the per-agent detail page. It now prefers the authoritative session-end total and otherwise sums only non-root per-turn spans, matching the Sessions list and the dashboard cost widget. (Distinct surface from the dashboard "Total cost (USD)" card fixed on 2026-06-14.)
+
 ## 2026-06-14
 
 ### Added

@@ -403,6 +403,15 @@ export const sessionsColumns: Columns<string, CodingAgentSessionRowView> = {
 		),
 		enableHiding: true,
 	},
+	// NOTE: the live Sessions list is a card list rendered by
+	// SignalRecords -> SessionRecord (signal-records.tsx), which shows the
+	// tri-state liveness pill (running/idle/completed) via
+	// deriveSessionLiveState for sessions with no real outcome. This column
+	// `cell` is only consumed by VisibilityColumns (key + enableHiding) and
+	// is NOT rendered today; it's a fallback for a future DataTable
+	// consumer. If you wire this column up, derive the same liveState here
+	// (and add idle/completed to OUTCOME_TONE) so it doesn't regress to the
+	// bare "—" for stale sessions.
 	outcome: {
 		header: () => m.AGENTS_CODING_SESSIONS_OUTCOME,
 		cell: ({ row }) => (

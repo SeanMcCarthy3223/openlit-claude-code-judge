@@ -1,5 +1,6 @@
 "use client";
 
+import { useEffect, useState } from "react";
 import { format } from "date-fns";
 import {
 	BarChart3,
@@ -19,6 +20,11 @@ import {
 	hasCodingAgentVendorIcon,
 } from "@/components/svg/coding-agents";
 import getMessage from "@/constants/messages";
+import {
+	deriveSessionLiveState,
+	shouldShowLiveState,
+	type SessionLiveState,
+} from "@/lib/platform/coding-agents/session-liveness";
 
 const m = getMessage();
 
@@ -352,14 +358,48 @@ function durationLabel(ms: number) {
 	return `${(min / 60).toFixed(1)}h`;
 }
 
+const TONE_EMERALD =
+	"bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300";
+const TONE_AMBER =
+	"bg-amber-100 text-amber-700 dark:bg-amber-950 dark:text-amber-300";
+const TONE_SKY = "bg-sky-100 text-sky-700 dark:bg-sky-950 dark:text-sky-300";
+
 const SESSION_OUTCOME_TONE: Record<string, string> = {
-	merged:
-		"bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300",
-	committed:
-		"bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300",
-	abandoned_with_change:
-		"bg-amber-100 text-amber-700 dark:bg-amber-950 dark:text-amber-300",
+	merged: TONE_EMERALD,
+	committed: TONE_EMERALD,
+	completed: TONE_EMERALD,
+	abandoned_with_change: TONE_AMBER,
 };
+
+// Fallback "liveness" pills, shown only when a session carries no real
+// end-of-session outcome (see shouldShowLiveState / deriveSessionLiveState).
+// `running` keeps the original blue; `idle` is a calmer amber ("quiet,
+// maybe still alive"); `completed` reuses the emerald outcome tone so an
+// aged-out session reads as done rather than perpetually running. Note a
+// *real* outcome of "completed" also resolves to emerald via
+// SESSION_OUTCOME_TONE above, so both branches land on the same green.
+const SESSION_LIVE_TONE: Record<SessionLiveState, string> = {
+	running: TONE_SKY,
+	idle: TONE_AMBER,
+	completed: TONE_EMERALD,
+};
+
+// Ticking "now" used to derive session liveness. Starts null so the server
+// render and the client's first paint agree (no hydration mismatch on the
+// boundary seconds), then sets on mount and re-ticks every minute — coarse
+// enough for the 30-minute / 48-hour thresholds, cheap enough to leave
+// running. `enabled` gates it to the sessions view so other signal lists
+// don't spin a needless timer.
+function useNowMs(enabled: boolean, intervalMs = 60_000): number | null {
+	const [nowMs, setNowMs] = useState<number | null>(null);
+	useEffect(() => {
+		if (!enabled) return;
+		setNowMs(Date.now());
+		const id = setInterval(() => setNowMs(Date.now()), intervalMs);
+		return () => clearInterval(id);
+	}, [enabled, intervalMs]);
+	return nowMs;
+}
 
 const SESSION_CLASS_TONE: Record<string, string> = {
 	work: "bg-blue-100 text-blue-700 dark:bg-blue-950 dark:text-blue-300",
@@ -478,11 +518,16 @@ function SessionRecord({
 	visibilityColumns,
 	isSelected,
 	onOpen,
+	nowMs,
 }: {
 	row: any;
 	visibilityColumns: Record<string, boolean>;
 	isSelected?: boolean;
 	onOpen: (row: any) => void;
+	// Ticking clock from the parent (null until mounted). Single source of
+	// time so every row's liveness re-derives together, and the list
+	// self-ages without per-row timers.
+	nowMs: number | null;
 }) {
 	const show = (key: string) => visibilityColumns[key] !== false;
 	const sessionId = row.session_id || "";
@@ -510,6 +555,13 @@ function SessionRecord({
 		: "";
 	const branchName = (row.branch || "").trim();
 	const folderLabel = (row.working_dir_label || "").trim();
+	// Liveness fallback, shown only when the session never recorded a real
+	// end-of-session outcome (below). Recent span activity reads as
+	// "running"; quiet 30m–48h reads as "idle"; quiet >48h is treated as
+	// "completed" so a session whose graceful end never fired stops
+	// claiming to be running forever. Driven by the parent's ticking
+	// `nowMs` so it self-ages while the list sits open.
+	const liveState = deriveSessionLiveState(row.ended_at, nowMs);
 	return (
 		<button
 			type="button"
@@ -566,24 +618,26 @@ function SessionRecord({
 						   when no signal is decisive. Showing those as pills
 						   just clutters the row with two grey "unknown" chips
 						   per session. We render them only when they carry a
-						   real value; "running" stands in for "session is
-						   still open" so users still see SOMETHING when no
-						   end-of-session telemetry has landed yet. */}
-						{show("outcome") &&
-							row.outcome &&
-							row.outcome !== "unknown" && (
-								<span
-									className={`rounded px-1.5 py-0.5 text-[11px] font-medium ${tone(
-										SESSION_OUTCOME_TONE,
-										row.outcome
-									)}`}
-								>
-									{row.outcome}
-								</span>
-							)}
-						{show("outcome") && (!row.outcome || row.outcome === "unknown") && (
-							<span className="rounded px-1.5 py-0.5 text-[11px] font-medium bg-sky-100 text-sky-700 dark:bg-sky-950 dark:text-sky-300">
-								running
+						   real value. When there's no real outcome we show an
+						   inferred liveness pill instead (running / idle /
+						   completed) derived from last activity, so a session
+						   whose graceful end never fired ages out instead of
+						   claiming to run forever. */}
+						{show("outcome") && !shouldShowLiveState(row.outcome) && (
+							<span
+								className={`rounded px-1.5 py-0.5 text-[11px] font-medium ${tone(
+									SESSION_OUTCOME_TONE,
+									row.outcome
+								)}`}
+							>
+								{row.outcome}
+							</span>
+						)}
+						{show("outcome") && shouldShowLiveState(row.outcome) && (
+							<span
+								className={`rounded px-1.5 py-0.5 text-[11px] font-medium ${SESSION_LIVE_TONE[liveState]}`}
+							>
+								{liveState}
 							</span>
 						)}
 						{show("classification") &&
@@ -689,6 +743,10 @@ export default function SignalRecords({
 	onOpen: (row: any) => void;
 	selectedId?: string | null;
 }) {
+	// Single ticking clock for the whole sessions list so every row's
+	// liveness (running/idle/completed) re-derives together and self-ages
+	// while the list sits open. Hook must run before the early returns.
+	const nowMs = useNowMs(config.key === "sessions");
 	if (isLoading) {
 		return (
 			<div className="grid gap-2">
@@ -734,6 +792,7 @@ export default function SignalRecords({
 						key={config.getRowId(row)}
 						row={row}
 						visibilityColumns={visibilityColumns}
+						nowMs={nowMs}
 						// For sessions, `selectedId` is the OPEN session's root
 						// SpanId (the parent passes `previewSpanId`, not the live
 						// `?selected=` value). It stays put while the developer

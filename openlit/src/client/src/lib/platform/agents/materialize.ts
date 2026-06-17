@@ -509,20 +509,27 @@ async function discoverCodingAgents(
 	//     hub show $0.00 even when LLM-turn spans show real cost.
 	//   * `gen_ai.usage.cost` lives on per-turn LLM spans (Cursor
 	//     estimates from text length × static pricing; Claude Code
-	//     uses authoritative provider numbers).
+	//     uses authoritative provider numbers) AND on the session-root
+	//     span ('coding_agent.session'), where it carries the rolled-up
+	//     whole-session total. Summing it across ALL spans therefore
+	//     double-counts; we exclude the root span from the sum below.
 	//
-	// We sum both per session and `greatest()` them — exactly how the
-	// per-session list does it — so an authoritative session-end total
-	// wins when present and a turn-by-turn estimate keeps the row
-	// non-zero in the meantime. Active-user rollup also moves to
+	// We prefer the authoritative session-end total via `greatest()`,
+	// falling back to the sum of NON-root per-turn estimates — exactly
+	// how the per-session list (queries.ts SESSION_BASE_COLUMNS) and the
+	// dashboard 'Total cost (USD)' widget do it — so an authoritative
+	// session-end total wins when present and a turn-by-turn estimate
+	// keeps the row non-zero in the meantime. Active-user rollup also moves to
 	// `gen_ai.user.name` (which the CLI stamps as a resource attr) so
 	// it stops returning 0 when the per-span `user.id` isn't set.
 	// Materialize over CHAT_ID (= coalesce(parent_id, session_id)) so
 	// the hub stats agree with the Sessions list:
 	//   - 1 parent chat + N subagents = 1 session in both views
-	//   - cost is summed across all spans of the chat (the parent's
-	//     authoritative `coding_agent.session.cost_usd` still wins
-	//     when present, via greatest())
+	//   - cost is summed across the chat's NON-root spans (the
+	//     parent's authoritative `coding_agent.session.cost_usd` still
+	//     wins when present, via greatest()); the 'coding_agent.session'
+	//     root span is excluded from the sum so its rolled-up session
+	//     total isn't stacked on top of the per-turn children
 	//   - active_users stores the *raw* distinct-user count. The
 	//     COHORT_K_FLOOR mask used to live here, but it ran before
 	//     auth context was even resolved, so a single-developer OSS
@@ -591,12 +598,27 @@ async function discoverCodingAgents(
 					nullIf(SpanAttributes['session.id'], ''),
 					nullIf(ResourceAttributes['session.id'], '')
 				) AS chat_id,
-				-- session-end cost wins when present, otherwise sum of
-				-- per-turn cost estimates. Both are stamped on chat-level
-				-- spans (root and per LLM turn).
+				-- Per-chat cost. The session-root span ('coding_agent.session')
+				-- stamps gen_ai.usage.cost = the rolled-up WHOLE-SESSION total
+				-- at SessionEnd, on TOP of coding_agent.session.cost_usd. Every
+				-- per-turn child ('coding_agent.llm.turn') also stamps its own
+				-- gen_ai.usage.cost. So a naive sum of gen_ai.usage.cost across
+				-- ALL spans double-counts: it adds the session total (root) on
+				-- top of the per-turn children -- roughly 2x (the bug that made
+				-- the agents-hub Total Cost card read ~2x the detail page). We
+				-- must exclude the root span from the sum, exactly like the
+				-- Sessions list (queries.ts SESSION_BASE_COLUMNS) and the
+				-- dashboard 'Total cost (USD)' widget do. greatest() then lets
+				-- the authoritative session-end total win when present and a
+				-- turn-by-turn estimate keep the row non-zero for in-flight /
+				-- Codex sessions that never fired SessionEnd.
 				greatest(
 					toFloat64OrZero(any(SpanAttributes['coding_agent.session.cost_usd'])),
-					sumOrNull(toFloat64OrZero(SpanAttributes['gen_ai.usage.cost']))
+					sumOrNull(if(
+						SpanName != 'coding_agent.session',
+						toFloat64OrZero(SpanAttributes['gen_ai.usage.cost']),
+						0
+					))
 				) AS chat_cost,
 				-- Per-chat code-change rollups. The greatest(session-
 				-- rollup-attr, per-edit-decision-sum) pattern mirrors
