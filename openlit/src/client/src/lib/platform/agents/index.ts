@@ -349,12 +349,22 @@ async function loadAgents(params: ListAgentsParams): Promise<ListAgentsResult> {
 	// workload disappeared from the dashboard, which is exactly the bug
 	// the lifecycle UNION in the materializer is meant to prevent.
 	const stoppedRowClause = `desired_lifecycle.desired_status = 'stopped'`;
+	// Coding-agent rows are exempt from the last_seen lower bound. A coding
+	// vendor is a historical fact, not a live workload: once a vendor has
+	// ever emitted a span we want it listed forever, even after the user
+	// stops running it. Aging it out of the hub makes retained telemetry
+	// unreachable — there is no clickthrough to a vendor that isn't listed.
+	// (SDK/controller rows keep the bound; they represent live workloads and
+	// have their own heartbeat/tombstone semantics.)
+	const codingRowClause = `s.source = 'coding'`;
 	if (params.timeStart) {
 		where.push(
-			`(s.last_seen >= parseDateTimeBestEffort('${escape(params.timeStart)}') OR ${stoppedRowClause})`
+			`(s.last_seen >= parseDateTimeBestEffort('${escape(params.timeStart)}') OR ${stoppedRowClause} OR ${codingRowClause})`
 		);
 	} else {
-		where.push(`(s.last_seen >= now() - INTERVAL 30 DAY OR ${stoppedRowClause})`);
+		where.push(
+			`(s.last_seen >= now() - INTERVAL 30 DAY OR ${stoppedRowClause} OR ${codingRowClause})`
+		);
 	}
 	if (params.timeEnd) {
 		where.push(
@@ -374,24 +384,29 @@ async function loadAgents(params: ListAgentsParams): Promise<ListAgentsResult> {
 		`(s.source != 'sdk' OR s.last_seen >= now() - INTERVAL 10 MINUTE)`
 	);
 
-	// Same problem, different source: when a coding-agent vendor stops
-	// emitting (e.g. the user disables their Claude Code plugin), the
-	// materializer doesn't tombstone the row because
-	// `discoverCodingAgents` only returns vendors with current data —
-	// no INSERT means no new `last_materialized_at`, so the previous
-	// row (with its non-zero `coding_session_count_24h` /
-	// `coding_cost_usd_24h`) lingers until the 90d TTL. The hub then
-	// shows e.g. "Claude Code · 6 sessions · 1 user" with clickthrough
-	// landing on an empty detail page because otel_traces has no
-	// matching spans. Gating on `last_materialized_at` (not
-	// `last_seen` — last_seen is the timestamp of the last hosted span
-	// at the time of materialization, NOT when we last refreshed)
-	// hides coding rows whose materializer skipped them this round.
-	// 10 minutes matches the SDK guard and gives the cron-driven
-	// materializer plenty of headroom.
-	where.push(
-		`(s.source != 'coding' OR s.last_materialized_at >= now() - INTERVAL 10 MINUTE)`
-	);
+	// NOTE: there is deliberately no `last_materialized_at` freshness gate
+	// for coding rows.
+	//
+	// A gate here used to hide any coding row not re-materialized within 10
+	// minutes. Combined with `discoverCodingAgents`' 24h discovery window,
+	// that permanently erased every vendor idle for more than a day: no
+	// discovery -> no INSERT -> frozen `last_materialized_at` -> row hidden,
+	// with no time-range selection able to bring it back. Idle vendors
+	// disappeared from the hub exactly this way.
+	//
+	// The gate's original purpose — never show a vendor whose rollups are
+	// stale relative to otel_traces — is now enforced upstream instead:
+	// the materializer pairs the (still 24h) rollup query with an unbounded
+	// vendor census, so any vendor with at least one retained span is
+	// re-materialized (and its `*_24h` rollups honestly recomputed to 0 when
+	// idle) on every materializer tick. The rollup keeps its 24h bound
+	// because its countIf/sumIf aggregates discriminate on SpanName, not
+	// Timestamp — widening it would silently turn `*_24h` into all-time.
+	//
+	// Residual case: a vendor whose spans are ALL removed from otel_traces
+	// stops being discovered and its row lingers until the summary table's
+	// 90-day TTL. We accept that — this deployment retains traces
+	// indefinitely, so it cannot occur without a deliberate delete.
 
 	if (filters.source?.length) {
 		where.push(`s.source IN (${escapeList(filters.source)})`);

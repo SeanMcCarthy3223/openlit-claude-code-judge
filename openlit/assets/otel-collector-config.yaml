@@ -21,7 +21,11 @@ exporters:
     database: ${env:INIT_DB_DATABASE}
     username: ${env:INIT_DB_USERNAME}
     password: ${env:INIT_DB_PASSWORD}
-    ttl: 730h
+    # 0 = no TTL. The exporter stamps this onto any table it auto-creates,
+    # so a non-zero value silently gives that table a delete-after policy.
+    # This deployment retains telemetry indefinitely; see the matching note
+    # on otel_traces in assets/clickhouse-init.sh.
+    ttl: 0
     logs_table_name: otel_logs
     traces_table_name: otel_traces
     # Metrics use separate tables by type: otel_metrics_gauge, otel_metrics_sum,

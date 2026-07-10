@@ -45,7 +45,12 @@ CREATE TABLE IF NOT EXISTS otel_traces
 ENGINE = MergeTree
 PARTITION BY toDate(Timestamp)
 ORDER BY (ServiceName, SpanName, toDateTime(Timestamp))
-TTL toDateTime(Timestamp) + toIntervalHour(730)
+-- No TTL: traces are retained indefinitely. A 730h (30-day) TTL used to
+-- live here. With ttl_only_drop_parts it dropped whole day-partitions, so
+-- coding-agent history (sessions, per-turn cost, edit decisions) silently
+-- aged out a month after it was recorded and could never be recovered.
+-- Retention is a deployment policy: add a TTL back here only if this
+-- instance is explicitly meant to forget old telemetry.
 SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1
 "
 

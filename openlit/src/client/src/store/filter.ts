@@ -24,10 +24,21 @@ export const TIME_RANGE_TYPE: Record<TIME_RANGES, string> = {
 	"7D": "7D",
 	"1M": "1M",
 	"3M": "3M",
+	ALL: "ALL",
 	CUSTOM: "CUSTOM",
 };
 
 export const DEFAULT_TIME_RANGE = "24H";
+
+/**
+ * Lower bound for the "ALL" range. The Unix epoch predates any telemetry
+ * this system can store, so `Timestamp >= ALL_TIME_START` selects every
+ * retained row while keeping the `{start, end}` contract every consumer
+ * (query builders, route handlers, the signal-list fetch gate) already
+ * relies on. Using a real Date rather than `undefined` is what lets "ALL"
+ * flow through those paths untouched.
+ */
+export const ALL_TIME_START = new Date(0);
 
 const DEFAULT_LIMIT = 25;
 
@@ -58,6 +69,9 @@ export function getTimeLimitObject(
 		const currentDate = new Date();
 		set(object, `${keyPrefix}start`, addMonths(currentDate, -3));
 		set(object, `${keyPrefix}end`, currentDate);
+	} else if (value === TIME_RANGE_TYPE["ALL"]) {
+		set(object, `${keyPrefix}start`, ALL_TIME_START);
+		set(object, `${keyPrefix}end`, new Date());
 	} else if (value === TIME_RANGE_TYPE["CUSTOM"]) {
 		const start = extraParams?.start;
 		const end = extraParams?.end;

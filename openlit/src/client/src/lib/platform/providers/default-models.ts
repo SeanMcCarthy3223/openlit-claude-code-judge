@@ -383,6 +383,18 @@ export const DEFAULT_MODELS_BY_PROVIDER: Record<string, DefaultModelEntry[]> = {
 		// auto-pricer can match without falling back to the helper
 		// JSON path. Opus 4 / 4.1 use the legacy $15/$75 rate; 4.5+
 		// drops to $5/$25 per Anthropic's 2025-10 price change.
+		// Fable 5 sits ABOVE the Opus tier at $10/$50 — it is not an Opus
+		// SKU and must not inherit Opus rates. Without this row the
+		// auto-pricer cannot value a claude-fable-5 turn at all and leaves
+		// gen_ai.usage.cost at 0 (cli pricing.go had the same gap).
+		{
+			id: "claude-fable-5",
+			displayName: "Claude Fable 5",
+			contextWindow: 1000000,
+			inputPricePerMToken: 10.0,
+			outputPricePerMToken: 50.0,
+			capabilities: ["function-calling", "vision", "streaming", "thinking"],
+		},
 		{
 			id: "claude-haiku-4-5",
 			displayName: "Claude Haiku 4.5",
@@ -466,6 +478,14 @@ export const DEFAULT_MODELS_BY_PROVIDER: Record<string, DefaultModelEntry[]> = {
 		{
 			id: "claude-opus-4-7",
 			displayName: "Claude Opus 4.7",
+			contextWindow: 1000000,
+			inputPricePerMToken: 5.0,
+			outputPricePerMToken: 25.0,
+			capabilities: ["function-calling", "vision", "streaming", "thinking"],
+		},
+		{
+			id: "claude-opus-4-8",
+			displayName: "Claude Opus 4.8",
 			contextWindow: 1000000,
 			inputPricePerMToken: 5.0,
 			outputPricePerMToken: 25.0,

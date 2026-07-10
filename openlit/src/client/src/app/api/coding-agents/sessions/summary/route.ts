@@ -69,14 +69,13 @@ export async function POST(request: Request) {
 	try {
 		body = (await request.json()) as SummaryBody;
 	} catch {
-		// empty body is acceptable — bucket the default 24h window.
+		// empty body is acceptable — no lower bound, same as the list route.
 	}
 
-	// Default analysis window — match list/users routes. See B1.
-	const DEFAULT_WINDOW_HOURS = 24;
-	const start =
-		asDate(body.timeLimit?.start) ??
-		new Date(Date.now() - DEFAULT_WINDOW_HOURS * 60 * 60 * 1000);
+	// No implicit lower bound — match the list/users routes. `pickBucket`
+	// widens the histogram bucket for long spans, so an all-time request
+	// buckets by month rather than emitting a hour-per-row series.
+	const start = asDate(body.timeLimit?.start);
 	const end = asDate(body.timeLimit?.end);
 	const { bucket, label } = pickBucket(start, end);
 	const runFilters = (body.runFilters || {}) as Record<string, unknown>;
@@ -87,9 +86,11 @@ export async function POST(request: Request) {
 		`SpanName IN (${CODING_AGENT_SPAN_NAMES.map((name) => `'${name}'`).join(", ")})`,
 		`notEmpty(SpanAttributes['${CODING_AGENT_ATTR.sessionId}'])`,
 	];
-	where.push(
-		`Timestamp >= parseDateTimeBestEffort('${escape(start.toISOString())}')`
-	);
+	if (start) {
+		where.push(
+			`Timestamp >= parseDateTimeBestEffort('${escape(start.toISOString())}')`
+		);
+	}
 	if (end) {
 		where.push(
 			`Timestamp <= parseDateTimeBestEffort('${escape(end.toISOString())}')`

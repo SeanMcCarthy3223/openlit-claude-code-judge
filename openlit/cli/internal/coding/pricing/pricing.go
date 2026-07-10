@@ -124,6 +124,14 @@ type entry struct {
 // at 0 — their APIs don't surface a separate cache-write count.
 var table = []entry{
 	// --- Anthropic Claude family -----------------------------------
+	// Fable 5 / Mythos 5 sit ABOVE the Opus tier at $10/$50. Mythos 5 is
+	// the Project Glasswing sibling of Fable 5 — same rates, different id.
+	// Neither has a "-fast" SKU (fast mode is Opus 4.8/4.7 only), so no
+	// premium variant is needed here.
+	{
+		match: []string{"claude-fable-5", "claude-mythos-5", "claude-mythos-preview"},
+		rate:  Rate{InputPer1M: 10.00, OutputPer1M: 50.00, CachedReadPer1M: 1.00, CacheCreationPer1M: 12.50},
+	},
 	// Opus 4.5+ dropped to $5/$25 in 2025-10 (down from the original
 	// Opus 4 / 4.1 launch price of $15/$75). We special-case the
 	// later versions so Cursor's `claude-opus-4-7-thinking-*` SKUs and

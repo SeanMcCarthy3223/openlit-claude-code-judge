@@ -10,7 +10,11 @@ import {
 import { usePostHog } from "posthog-js/react";
 import { stripFilterParams } from "@/helpers/client/filter-persistence";
 import { prepareObservabilitySignalChange } from "@/helpers/client/observability";
-import { getUpdateConfig, getUpdateFilter } from "@/selectors/filter";
+import {
+	getFilterDetails,
+	getUpdateConfig,
+	getUpdateFilter,
+} from "@/selectors/filter";
 import { useRootStore } from "@/store";
 
 export default function TelemetryPage() {
@@ -19,6 +23,7 @@ export default function TelemetryPage() {
 	const posthog = usePostHog();
 	const updateConfig = useRootStore(getUpdateConfig);
 	const updateFilter = useRootStore(getUpdateFilter);
+	const filter = useRootStore(getFilterDetails);
 	const activeTab = searchParams.get("tab") || "traces";
 	const activeConfig = getSignalConfig(activeTab);
 	const ActiveIcon = activeConfig.icon;
@@ -46,7 +51,12 @@ export default function TelemetryPage() {
 	}, [activeTab]);
 
 	const onTabChange = (value: string) => {
-		prepareObservabilitySignalChange(updateConfig, updateFilter);
+		prepareObservabilitySignalChange(
+			updateConfig,
+			updateFilter,
+			value,
+			filter.timeLimit?.type
+		);
 		const params = new URLSearchParams(searchParams.toString());
 		stripFilterParams(params);
 		params.set("tab", value);

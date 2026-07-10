@@ -217,7 +217,7 @@ export default function BreakdownView({ record }: { record: TraceHeirarchySpan }
 			{/* 1. Token composition */}
 			{sectionTitle(m.OBSERVABILITY_BREAKDOWN_TOKENS_TITLE)}
 			<div className="overflow-x-auto rounded-md border border-stone-200 dark:border-stone-800">
-				<table className="w-full border-collapse text-xs">
+				<table className="w-full border-collapse text-xs text-stone-700 dark:text-stone-300">
 					<thead>
 						<tr className="bg-stone-50 text-left text-[11px] uppercase tracking-wide text-stone-500 dark:bg-stone-900 dark:text-stone-400">
 							<th className="px-2 py-1.5 font-medium">{m.OBSERVABILITY_BREAKDOWN_COL_KIND}</th>
@@ -255,7 +255,7 @@ export default function BreakdownView({ record }: { record: TraceHeirarchySpan }
 				<>
 					{sectionTitle(m.OBSERVABILITY_BREAKDOWN_TOOLS_TITLE)}
 					<div className="overflow-x-auto rounded-md border border-stone-200 dark:border-stone-800">
-						<table className="w-full border-collapse text-xs">
+						<table className="w-full border-collapse text-xs text-stone-700 dark:text-stone-300">
 							<thead>
 								<tr className="bg-stone-50 text-left text-[11px] uppercase tracking-wide text-stone-500 dark:bg-stone-900 dark:text-stone-400">
 									<th className="px-2 py-1.5 font-medium">{m.OBSERVABILITY_BREAKDOWN_COL_TOOL}</th>

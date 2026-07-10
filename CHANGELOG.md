@@ -2,6 +2,16 @@
 
 What this fork adds on top of upstream [OpenLIT CE](https://github.com/openlit/openlit) — a local, air-gapped Claude Code observability + LLM-judge setup. Newest first.
 
+## 2026-07-10
+
+### Added
+- **Pricing for Claude Fable 5 and Opus 4.8** — the CLI pricing table (`cli/internal/coding/pricing/pricing.go`) and the server auto-pricer (`default-models.ts`) now carry `claude-fable-5` (plus Mythos 5 aliases) at $10/$50 and `claude-opus-4-8` at $5/$25, with cache-read/write rates. Turns on these models previously fell through to `$0` because neither pricing source recognised the id.
+- **Indefinite trace retention by default** — removed the 730h (30-day) TTL from `otel_traces` (`assets/clickhouse-init.sh`) and set the OTel ClickHouse exporter to `ttl: 0` (`assets/otel-collector-config.yaml`). With `ttl_only_drop_parts` the old TTL dropped whole day-partitions, so coding-agent history (sessions, per-turn cost, edit decisions) silently aged out a month after capture and could never be recovered. Retention is now an explicit deployment choice rather than a silent 30-day default.
+
+### Fixed
+- **Idle coding vendors vanished from the Coding Agents hub** — vendor discovery was windowed to 24h (the width of the `*_24h` rollups), so a vendor idle for more than a day was never re-materialized: its `last_materialized_at` froze and the `listAgents` freshness gate hid the row forever while every one of its spans sat intact in ClickHouse. Discovery is now an unbounded all-time census independent of the rollup window, coding rows are exempt from the `last_seen` lower bound, and an idle vendor re-materializes every tick with honest zero `*_24h` stats. Adds materializer unit tests pinning the idle-vendor and census-merge behaviour.
+- **Coding Sessions tab rendered empty on load** — the global 24h default hid every coding session older than a day even though the telemetry was retained. The Sessions tab now switches to the ALL time range, and the sessions API dropped its implicit 24h lower bound, so historically-browsed sessions (routinely days or weeks old) show up instead of an empty list.
+
 ## 2026-06-16
 
 ### Added

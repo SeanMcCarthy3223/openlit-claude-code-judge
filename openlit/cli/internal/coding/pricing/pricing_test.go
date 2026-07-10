@@ -10,6 +10,11 @@ func TestLookupAnthropic(t *testing.T) {
 		model string
 		want  Rate
 	}{
+		// Fable 5 / Mythos 5 are the $10/$50 tier, ABOVE Opus. Pinned
+		// because a missing entry makes Lookup return the zero Rate, which
+		// silently stamps $0 on every turn (the bug this test now guards).
+		{"claude-fable-5", Rate{InputPer1M: 10.00, OutputPer1M: 50.00, CachedReadPer1M: 1.00, CacheCreationPer1M: 12.50}},
+		{"claude-mythos-5", Rate{InputPer1M: 10.00, OutputPer1M: 50.00, CachedReadPer1M: 1.00, CacheCreationPer1M: 12.50}},
 		// Sonnet 4.x / 3.5: $3/$15 across all minor revisions.
 		{"claude-sonnet-4-5-20251022", Rate{InputPer1M: 3.00, OutputPer1M: 15.00, CachedReadPer1M: 0.30, CacheCreationPer1M: 3.75}},
 		{"claude-3-5-sonnet-20241022", Rate{InputPer1M: 3.00, OutputPer1M: 15.00, CachedReadPer1M: 0.30, CacheCreationPer1M: 3.75}},

@@ -3,6 +3,7 @@ import {
   TIME_RANGE_TYPE,
   REFRESH_RATE_TYPE,
   DEFAULT_TIME_RANGE,
+  ALL_TIME_START,
 } from '@/store/filter';
 import { addDays, addWeeks, addMonths } from 'date-fns';
 
@@ -12,11 +13,12 @@ describe('TIME_RANGE_TYPE', () => {
     expect(TIME_RANGE_TYPE).toHaveProperty('7D', '7D');
     expect(TIME_RANGE_TYPE).toHaveProperty('1M', '1M');
     expect(TIME_RANGE_TYPE).toHaveProperty('3M', '3M');
+    expect(TIME_RANGE_TYPE).toHaveProperty('ALL', 'ALL');
     expect(TIME_RANGE_TYPE).toHaveProperty('CUSTOM', 'CUSTOM');
   });
 
-  it('has exactly 5 time range options', () => {
-    expect(Object.keys(TIME_RANGE_TYPE)).toHaveLength(5);
+  it('has exactly 6 time range options', () => {
+    expect(Object.keys(TIME_RANGE_TYPE)).toHaveLength(6);
   });
 });
 
@@ -69,6 +71,22 @@ describe('getTimeLimitObject', () => {
     const result = getTimeLimitObject('3M', '') as { start: Date; end: Date };
     const expectedStart = addMonths(new Date(), -3);
     expect(Math.abs(result.start.getTime() - expectedStart.getTime())).toBeLessThan(TOLERANCE_MS);
+  });
+
+  // "ALL" must produce a concrete {start, end} pair, not undefined: the
+  // signal-list only fires a fetch when both are set, and every route
+  // handler interpolates start into `Timestamp >= ...`. Epoch predates any
+  // storable telemetry, so it selects every retained row.
+  it('returns the epoch as start and ~now as end for ALL', () => {
+    const before = Date.now();
+    const result = getTimeLimitObject('ALL', '') as { start: Date; end: Date };
+    const after = Date.now();
+
+    expect(result.start).toBeInstanceOf(Date);
+    expect(result.start.getTime()).toBe(0);
+    expect(result.start).toEqual(ALL_TIME_START);
+    expect(result.end.getTime()).toBeGreaterThanOrEqual(before);
+    expect(result.end.getTime()).toBeLessThanOrEqual(after + TOLERANCE_MS);
   });
 
   it('uses provided start and end for CUSTOM range', () => {

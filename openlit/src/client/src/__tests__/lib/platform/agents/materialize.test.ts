@@ -68,19 +68,24 @@ function queueDiscovery(
 	sdkRows: Array<Record<string, unknown>>,
 	ctrlRows: Array<Record<string, unknown>>,
 	requestCountRows: Array<Record<string, unknown>> = [],
-	codingRows: Array<Record<string, unknown>> = []
+	codingRows: Array<Record<string, unknown>> = [],
+	codingCensusRows: Array<Record<string, unknown>> = []
 ) {
 	// `materializeAgents` fires `Promise.all([discoverAgents(),
-	// discoverCodingAgents()])`. Inside `discoverAgents` two queries run
-	// sequentially (SDK then controller); `discoverCodingAgents` fires
-	// one. The microtask order under `Promise.all` is therefore:
+	// discoverCodingAgentsForMaterialization()])`. Inside `discoverAgents`
+	// two queries run sequentially (SDK then controller);
+	// `discoverCodingAgentsForMaterialization` fires two concurrently (the
+	// 24h rollup, then the all-time vendor census). The microtask order
+	// under `Promise.all` is therefore:
 	//   1) SDK discovery (kicked off first inside discoverAgents)
-	//   2) Coding-agent discovery (kicked off by the second Promise.all entry)
-	//   3) Controller discovery (resumes after SDK resolves)
-	//   4) Request-count rollup (after both discovery functions resolve)
+	//   2) Coding-agent 24h rollup
+	//   3) Coding-agent all-time vendor census
+	//   4) Controller discovery (resumes after SDK resolves)
+	//   5) Request-count rollup (after both discovery functions resolve)
 	mockedDC
 		.mockResolvedValueOnce({ data: sdkRows } as any)
 		.mockResolvedValueOnce({ data: codingRows } as any)
+		.mockResolvedValueOnce({ data: codingCensusRows } as any)
 		.mockResolvedValueOnce({ data: ctrlRows } as any)
 		.mockResolvedValueOnce({ data: requestCountRows } as any);
 }
@@ -445,5 +450,193 @@ describe("materializeAgents — coding-agent cost rollup", () => {
 		expect(codingQuery!).not.toMatch(
 			/sumOrNull\(\s*toFloat64OrZero\(SpanAttributes\['gen_ai\.usage\.cost'\]\)\s*\)/
 		);
+	});
+});
+
+
+describe("materializeAgents — idle coding vendors stay materialized", () => {
+	/**
+	 * Dispatch on query text rather than call order.
+	 *
+	 * `queueDiscovery`'s positional `mockResolvedValueOnce` chain is fragile:
+	 * the number of queries issued before the summary INSERT varies with the
+	 * shape of the discovered rows, so a surplus queued value silently
+	 * swallows the INSERT and the test observes zero inserts. Matching on
+	 * query text is stable under that variation.
+	 */
+	function mockCodingDiscovery(opts: {
+		rollup?: Array<Record<string, unknown>>;
+		census?: Array<Record<string, unknown>>;
+	}) {
+		const inserts: RecordedInsert[] = [];
+		mockedDC.mockImplementation(async (config: any, op: string) => {
+			if (op === "insert") {
+				inserts.push({
+					table: String(config.table),
+					values: (config.values || []) as Array<Record<string, unknown>>,
+				});
+				return { data: [] } as any;
+			}
+			const q = String(config.query || "");
+			// The 24h rollup is the only coding query that prices sessions.
+			if (q.includes("coding_agent.session.cost_usd")) {
+				return { data: opts.rollup ?? [] } as any;
+			}
+			// The census reads client.version but never touches cost.
+			if (q.includes("coding_agent.client.version")) {
+				return { data: opts.census ?? [] } as any;
+			}
+			return { data: [] } as any;
+		});
+		return inserts;
+	}
+
+	// Regression: a coding vendor idle for more than 24h fell out of
+	// `discoverCodingAgents` (whose window is 24h because that is the width
+	// of the `*_24h` rollups). No discovery meant no INSERT, so its
+	// `last_materialized_at` froze and `listAgents`' freshness gate hid the
+	// row forever — an idle vendor vanished from the hub while every
+	// one of its spans sat intact in otel_traces.
+	//
+	// Vendor discovery is now unbounded and independent of the rollup
+	// window, so an idle vendor is re-materialized on every tick with
+	// honest zeroes for its 24h stats.
+	it("materializes a vendor absent from the 24h rollup but present in the all-time census", async () => {
+		const inserts = mockCodingDiscovery({
+			rollup: [], // idle for 12 days
+			census: [
+				{
+					vendor: "codex",
+					first_seen: "2026-06-26 04:12:18",
+					last_seen: "2026-06-26 19:02:36",
+					client_version: "0.4.1",
+				},
+			],
+		});
+
+		await materializeAgents();
+
+		const rows = inserts.flatMap((i) => i.values);
+		const idle = rows.find((r) => r.service_name === "codex");
+		expect(idle).toBeDefined();
+		expect(idle!.source).toBe("coding");
+		expect(idle!.coding_agent_vendor).toBe("codex");
+		// Activity bounds come from the census, not the empty rollup.
+		expect(idle!.first_seen).toBe("2026-06-26 04:12:18");
+		expect(idle!.last_seen).toBe("2026-06-26 19:02:36");
+		// Idle means zero recent activity — not a missing row.
+		expect(idle!.coding_session_count_24h).toBe(0);
+		expect(idle!.coding_cost_usd_24h).toBe(0);
+		expect(idle!.coding_active_users_24h).toBe(0);
+	});
+
+	it("widens first_seen from the census for a vendor that IS active in the last 24h", async () => {
+		const inserts = mockCodingDiscovery({
+			// The 24h rollup clamps first_seen to the window edge.
+			rollup: [
+				{
+					vendor: "claude-code",
+					client_version: "2.1.0",
+					first_seen: "2026-07-08 00:00:00",
+					last_seen: "2026-07-09 01:10:31",
+					session_count_24h: 3,
+					cost_usd_24h: 12.5,
+					active_users_24h: 1,
+				},
+			],
+			// The census knows it has been emitting since June.
+			census: [
+				{
+					vendor: "claude-code",
+					first_seen: "2026-06-14 00:16:47",
+					last_seen: "2026-07-09 01:10:31",
+					client_version: "2.1.0",
+				},
+			],
+		});
+
+		await materializeAgents();
+
+		const rows = inserts.flatMap((i) => i.values);
+		const cc = rows.find((r) => r.service_name === "claude-code");
+		expect(cc).toBeDefined();
+		// True first activity, not the 24h-window edge.
+		expect(cc!.first_seen).toBe("2026-06-14 00:16:47");
+		// The 24h rollups survive the census merge untouched.
+		expect(cc!.coding_session_count_24h).toBe(3);
+		expect(cc!.coding_cost_usd_24h).toBe(12.5);
+	});
+
+	it("emits one row per vendor when an idle and an active vendor coexist", async () => {
+		const inserts = mockCodingDiscovery({
+			rollup: [
+				{
+					vendor: "claude-code",
+					client_version: "2.1.0",
+					first_seen: "2026-07-08 00:00:00",
+					last_seen: "2026-07-09 01:10:31",
+					session_count_24h: 3,
+				},
+			],
+			census: [
+				{
+					vendor: "claude-code",
+					first_seen: "2026-06-14 00:16:47",
+					last_seen: "2026-07-09 01:10:31",
+					client_version: "2.1.0",
+				},
+				{
+					vendor: "codex",
+					first_seen: "2026-05-17 23:06:54",
+					last_seen: "2026-06-16 22:14:26",
+					client_version: "1.0.0",
+				},
+			],
+		});
+
+		await materializeAgents();
+
+		const coding = inserts
+			.flatMap((i) => i.values)
+			.filter((r) => r.source === "coding");
+		expect(coding.map((r) => r.service_name).sort()).toEqual([
+			"claude-code",
+			"codex",
+		]);
+		// The active vendor is not duplicated by the census merge.
+		expect(coding.filter((r) => r.service_name === "claude-code")).toHaveLength(
+			1
+		);
+	});
+
+	it("keeps vendor discovery unbounded while the rollup query stays windowed to 24h", async () => {
+		const queries: string[] = [];
+		mockedDC.mockImplementation(async (config: any, op: string) => {
+			if (op === "query") {
+				queries.push(String(config.query));
+				return { data: [] } as any;
+			}
+			return { data: [] } as any;
+		});
+
+		await materializeAgents();
+
+		// The rollup query keeps its 24h bound — widening it would silently
+		// turn every `*_24h` hub stat into an all-time total.
+		const rollupQuery = queries.find((q) =>
+			q.includes("coding_agent.session.cost_usd")
+		);
+		expect(rollupQuery).toBeDefined();
+		expect(rollupQuery!).toContain("Timestamp >= now() - INTERVAL 24 HOUR");
+
+		// The census query must carry no time predicate at all.
+		const censusQuery = queries.find(
+			(q) =>
+				q.includes("coding_agent.client.version") &&
+				!q.includes("coding_agent.session.cost_usd")
+		);
+		expect(censusQuery).toBeDefined();
+		expect(censusQuery!).not.toContain("INTERVAL");
+		expect(censusQuery!).not.toContain("Timestamp >=");
 	});
 });

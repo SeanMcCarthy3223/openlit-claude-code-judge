@@ -49,16 +49,10 @@ export async function GET(
 	const since = url.searchParams.get("since");
 	const until = url.searchParams.get("until");
 
-	// Default 24h window when the caller didn't pass one. Matches
-	// /api/coding-agents/sessions and /api/coding-agents/users so
-	// the per-user header card agrees with the lists by default —
-	// previously this route ran an unbounded all-time aggregation
-	// on cold loads (before the filter store hydrated) and diverged
-	// from every sibling endpoint.
-	const DEFAULT_WINDOW_HOURS = 24;
-	const sinceDate = since
-		? new Date(since)
-		: new Date(Date.now() - DEFAULT_WINDOW_HOURS * 60 * 60 * 1000);
+	// No implicit lower bound when the caller didn't pass one. Matches
+	// /api/coding-agents/sessions and /api/coding-agents/users so the
+	// per-user header card agrees with the lists by default.
+	const sinceDate = since ? new Date(since) : null;
 	const untilDate = until ? new Date(until) : null;
 
 	try {

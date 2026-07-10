@@ -110,7 +110,12 @@ export default function ObservabilitySignalList({
 	} = useFetchWrapper();
 
 	useEffect(() => {
-		prepareObservabilitySignalChange(updateConfig, updateFilter);
+		prepareObservabilitySignalChange(
+			updateConfig,
+			updateFilter,
+			config.key,
+			filter.timeLimit?.type
+		);
 		// eslint-disable-next-line react-hooks/exhaustive-deps
 	}, [config.key]);
 

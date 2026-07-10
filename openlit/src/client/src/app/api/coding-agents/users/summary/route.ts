@@ -85,10 +85,8 @@ export async function POST(request: Request) {
 		// sessions summary route.
 	}
 
-	const DEFAULT_WINDOW_HOURS = 24;
-	const start =
-		asDate(body.timeLimit?.start) ??
-		new Date(Date.now() - DEFAULT_WINDOW_HOURS * 60 * 60 * 1000);
+	// No implicit lower bound — match the list/sessions routes.
+	const start = asDate(body.timeLimit?.start);
 	const end = asDate(body.timeLimit?.end);
 	const { bucket, label } = pickBucket(start, end);
 	const runFilters = (body.runFilters || {}) as Record<string, unknown>;
@@ -99,9 +97,11 @@ export async function POST(request: Request) {
 		`SpanName IN (${CODING_AGENT_SPAN_NAMES.map((name) => `'${name}'`).join(", ")})`,
 		`notEmpty(SpanAttributes['${CODING_AGENT_ATTR.sessionId}'])`,
 	];
-	where.push(
-		`Timestamp >= parseDateTimeBestEffort('${escape(start.toISOString())}')`
-	);
+	if (start) {
+		where.push(
+			`Timestamp >= parseDateTimeBestEffort('${escape(start.toISOString())}')`
+		);
+	}
 	if (end) {
 		where.push(
 			`Timestamp <= parseDateTimeBestEffort('${escape(end.toISOString())}')`

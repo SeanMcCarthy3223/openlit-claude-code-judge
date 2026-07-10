@@ -1,4 +1,4 @@
-export type TIME_RANGES = "24H" | "7D" | "1M" | "3M" | "CUSTOM";
+export type TIME_RANGES = "24H" | "7D" | "1M" | "3M" | "ALL" | "CUSTOM";
 export type REFRESH_RATES = "Never" | "30s" | "1m" | "5m" | "15m";
 export type GroupByKey = string;
 

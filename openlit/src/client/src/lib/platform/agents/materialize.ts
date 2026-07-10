@@ -454,6 +454,14 @@ function escapeTimestamp(value: string): string {
 	return value.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
 }
 
+// The rollup window stays 24h. Every `*_24h` column below is computed from
+// the rows this clause selects (the countIf/sumIf aggregates discriminate
+// on SpanName, not on Timestamp), so widening it here would silently turn
+// `session_count_24h` / `cost_usd_24h` / `active_users_24h` into all-time
+// totals and inflate the hub cards.
+//
+// Vendor DISCOVERY is a separate concern and must NOT be bounded — see
+// `discoverCodingVendorsAllTime` and `discoverCodingAgentsForMaterialization`.
 function buildCodingWindowClause(
 	window: CodingAgentDiscoveryWindow | undefined
 ): string {
@@ -480,6 +488,169 @@ function buildCodingWindowClause(
 		return "Timestamp >= now() - INTERVAL 24 HOUR";
 	}
 	return clauses.join(" AND ");
+}
+
+// Shared by the 24h rollup query and the all-time vendor census below, so
+// the two can never disagree about what counts as a coding-agent span or
+// which vendor it belongs to.
+const CODING_VENDOR_EXPR = `
+	coalesce(
+		nullIf(SpanAttributes['coding_agent.client'], ''),
+		nullIf(ResourceAttributes['gen_ai.agent.name'], ''),
+		nullIf(ResourceAttributes['service.name'], '')
+	)
+`;
+
+const CODING_SPAN_PREDICATE = `
+	(
+		SpanAttributes['coding_agent.session.id'] != ''
+		OR ResourceAttributes['coding_agent.session.id'] != ''
+		-- Native Claude Code OTel: signed by service.name and
+		-- a plain session.id attribute. Without this branch a
+		-- CLAUDE_CODE_ENABLE_TELEMETRY=1-only install would
+		-- never reach the hub.
+		OR (
+			ResourceAttributes['service.name'] = 'claude-code'
+			AND (SpanAttributes['session.id'] != '' OR ResourceAttributes['session.id'] != '')
+		)
+	)
+`;
+
+/**
+ * All-time census of every coding-agent vendor that has ever emitted a
+ * span, with its true first/last activity.
+ *
+ * This exists because vendor DISCOVERY and stat ROLLUP have different
+ * natural windows. `discoverCodingAgents` computes 24h rollups, so it can
+ * only ever return vendors active in the last 24h. Using it as the
+ * materializer's discovery source meant an idle vendor was never
+ * re-materialized, its `last_materialized_at` froze, and the hub dropped
+ * it — an idle vendor vanished this way while its
+ * telemetry sat intact in otel_traces.
+ *
+ * Kept cheap on purpose: a single GROUP BY over the vendor expression with
+ * no per-chat sub-aggregation, so the unbounded scan stays far lighter
+ * than the windowed rollup it complements.
+ */
+async function discoverCodingVendorsAllTime(dbConfigId?: string): Promise<
+	Map<
+		string,
+		{ first_seen: string; last_seen: string; client_version: string }
+	>
+> {
+	const query = `
+		SELECT
+			${CODING_VENDOR_EXPR} AS vendor,
+			min(Timestamp) AS first_seen,
+			max(Timestamp) AS last_seen,
+			argMax(SpanAttributes['coding_agent.client.version'], Timestamp) AS client_version
+		FROM ${OTEL_TRACES_TABLE_NAME}
+		WHERE ${CODING_SPAN_PREDICATE}
+		GROUP BY vendor
+		HAVING vendor != ''
+	`;
+
+	const res = await dataCollector({ query }, "query", dbConfigId);
+	if (res.err) {
+		agentsLogger.error("materializer_coding_census_failed", { err: res.err });
+		return new Map();
+	}
+	const rows = (res.data as Array<{
+		vendor: string;
+		first_seen: string;
+		last_seen: string;
+		client_version: string;
+	}>) || [];
+
+	return new Map(
+		rows
+			.filter((r) => r.vendor)
+			.map((r) => [
+				r.vendor,
+				{
+					first_seen: r.first_seen,
+					last_seen: r.last_seen,
+					client_version: r.client_version || "",
+				},
+			])
+	);
+}
+
+/**
+ * Discovery source for the materializer: every vendor ever seen, carrying
+ * live 24h rollups when it was active in the last 24h and honest zeroes
+ * when it was not.
+ *
+ * Because every known vendor is returned on every tick, each one keeps a
+ * current `last_materialized_at` and stays visible in the Coding Agents
+ * hub for as long as its telemetry is retained.
+ */
+async function discoverCodingAgentsForMaterialization(
+	dbConfigId?: string
+): Promise<DiscoveredAgent[]> {
+	const [active, census] = await Promise.all([
+		discoverCodingAgents(dbConfigId),
+		discoverCodingVendorsAllTime(dbConfigId),
+	]);
+
+	const merged: DiscoveredAgent[] = active.map((agent) => {
+		// The 24h rollup only ever sees the last day, so its first_seen is
+		// clamped to that window. Widen it (and last_seen, defensively) with
+		// the census's true bounds.
+		const seen = census.get(agent.service_name);
+		if (!seen) return agent;
+		return {
+			...agent,
+			first_seen: earliest(agent.first_seen, seen.first_seen),
+			last_seen: latest(agent.last_seen, seen.last_seen),
+		};
+	});
+
+	const activeVendors = new Set(active.map((a) => a.service_name));
+	// Array.from: the tsconfig target predates for..of over a Map iterator.
+	for (const [vendor, seen] of Array.from(census.entries())) {
+		if (activeVendors.has(vendor)) continue;
+		// Idle vendor: real identity and activity bounds, all-zero 24h stats.
+		merged.push(buildIdleCodingAgent(vendor as CodingAgentVendor, seen));
+	}
+	return merged;
+}
+
+/** An ever-seen vendor with no activity in the rollup window. */
+function buildIdleCodingAgent(
+	vendor: CodingAgentVendor,
+	seen: { first_seen: string; last_seen: string; client_version: string }
+): DiscoveredAgent {
+	const cluster = "coding";
+	const env = "default";
+	return {
+		agent_key: computeAgentKey(cluster, env, vendor),
+		service_name: vendor,
+		environment: env,
+		cluster_id: cluster,
+		workload_key: "",
+		source: "coding" as AgentSource,
+		controller_service_id: "",
+		controller_instance_id: "",
+		sdk_version: seen.client_version,
+		sdk_language: "",
+		first_seen: seen.first_seen,
+		last_seen: seen.last_seen,
+		instrumentation_status: "instrumented",
+		controller_llm_providers: [],
+		coding_agent_vendor: vendor,
+		coding_session_count_24h: 0,
+		coding_cost_usd_24h: 0,
+		coding_active_users_24h: 0,
+		coding_lines_added_24h: 0,
+		coding_lines_removed_24h: 0,
+		coding_lines_accepted_24h: 0,
+		coding_lines_rejected_24h: 0,
+		coding_edit_accept_24h: 0,
+		coding_edit_reject_24h: 0,
+		coding_commit_count_24h: 0,
+		coding_pr_count_24h: 0,
+	};
 }
 
 /**
@@ -563,13 +734,7 @@ async function discoverCodingAgents(
 	// vendor's spans happened to dominate the chat id and the user
 	// sees Cursor traffic counted against the Claude Code agent (or
 	// vice versa). The expression must mirror queries.ts PER_SPAN_VENDOR_EXPR.
-	const perSpanVendor = `
-		coalesce(
-			nullIf(SpanAttributes['coding_agent.client'], ''),
-			nullIf(ResourceAttributes['gen_ai.agent.name'], ''),
-			nullIf(ResourceAttributes['service.name'], '')
-		)
-	`;
+	const perSpanVendor = CODING_VENDOR_EXPR;
 	const query = `
 		SELECT
 			vendor,
@@ -690,18 +855,7 @@ async function discoverCodingAgents(
 				argMax(SpanAttributes['coding_agent.client.version'], Timestamp) AS client_version
 			FROM ${OTEL_TRACES_TABLE_NAME}
 			WHERE ${buildCodingWindowClause(window)}
-				AND (
-					SpanAttributes['coding_agent.session.id'] != ''
-					OR ResourceAttributes['coding_agent.session.id'] != ''
-					-- Native Claude Code OTel: signed by service.name and
-					-- a plain session.id attribute. Without this branch a
-					-- CLAUDE_CODE_ENABLE_TELEMETRY=1-only install would
-					-- never reach the hub.
-					OR (
-						ResourceAttributes['service.name'] = 'claude-code'
-						AND (SpanAttributes['session.id'] != '' OR ResourceAttributes['session.id'] != '')
-					)
-				)
+				AND ${CODING_SPAN_PREDICATE}
 			GROUP BY chat_id, ${perSpanVendor}
 			HAVING vendor != ''
 		) per_chat
@@ -961,7 +1115,7 @@ export async function materializeAgents(
 		// is in fact a coding agent. See coding-agents-hook.mdc §10.
 		const [sdkAll, codingAll] = await Promise.all([
 			discoverAgents(dbConfigId, scope.clusterId),
-			discoverCodingAgents(dbConfigId),
+			discoverCodingAgentsForMaterialization(dbConfigId),
 		]);
 		const match =
 			sdkAll.find((a) => a.agent_key === key) ||
@@ -982,7 +1136,7 @@ export async function materializeAgents(
 		}
 	} else if (agentKeyFilter) {
 		const all = await discoverAgents(dbConfigId);
-		const codingAll = await discoverCodingAgents(dbConfigId);
+		const codingAll = await discoverCodingAgentsForMaterialization(dbConfigId);
 		const match =
 			all.find((a) => a.agent_key === agentKeyFilter) ||
 			codingAll.find((a) => a.agent_key === agentKeyFilter);
@@ -990,7 +1144,7 @@ export async function materializeAgents(
 	} else {
 		const [traditional, coding] = await Promise.all([
 			discoverAgents(dbConfigId),
-			discoverCodingAgents(dbConfigId),
+			discoverCodingAgentsForMaterialization(dbConfigId),
 		]);
 		discovered = [...traditional, ...coding];
 	}

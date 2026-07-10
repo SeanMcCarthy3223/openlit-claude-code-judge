@@ -70,16 +70,16 @@ function asDate(value: unknown): Date | null {
 	return Number.isNaN(date.getTime()) ? null : date;
 }
 
-// Default analysis window when the caller omits one. We refuse to run
-// an unbounded `otel_traces` scan: at 1M spans/day a missed filter
-// can easily timeout the ClickHouse query and (worse) widen the
-// cohort floor's surface area to historical data. 24h matches the
-// hub's materializer window so the Sessions tab and Spend hub
-// agree by default.
-const DEFAULT_WINDOW_HOURS = 24;
-function defaultSince(): Date {
-	return new Date(Date.now() - DEFAULT_WINDOW_HOURS * 60 * 60 * 1000);
-}
+// No implicit lower bound. A caller that omits `timeLimit.start` means
+// "every retained session", and we honour that.
+//
+// This used to default to a 24h window, on the reasoning that an
+// unbounded `otel_traces` scan could time out. In practice it silently
+// hid every session older than a day — a developer's last coding
+// session is routinely days or weeks old — while the UI's "ALL" range
+// already issues the same unbounded scan explicitly, so the floor bought
+// no protection and cost correctness. Callers that want a window send
+// one.
 
 export async function POST(request: Request) {
 	let auth;
@@ -117,9 +117,8 @@ export async function POST(request: Request) {
 		)
 			? (asString(runFilters.classification) as ListSessionsOptions["classification"])
 			: null,
-		// Time window defaults to last 24h if the caller didn't send
-		// one. See `defaultSince` for rationale.
-		since: asDate(body.timeLimit?.start) ?? defaultSince(),
+		// Unbounded when the caller sends no start — all retained sessions.
+		since: asDate(body.timeLimit?.start),
 		until: asDate(body.timeLimit?.end),
 		sortBy: asSessionsSortBy(body.sorting?.type),
 		sortDir: asSortDir(body.sorting?.direction),

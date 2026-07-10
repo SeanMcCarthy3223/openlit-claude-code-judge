@@ -56,12 +56,9 @@ function asDate(value: unknown): Date | null {
 	return Number.isNaN(date.getTime()) ? null : date;
 }
 
-// Default analysis window matches the Sessions route — see B1
-// rationale: never let a missing filter trigger an all-time scan.
-const DEFAULT_WINDOW_HOURS = 24;
-function defaultSince(): Date {
-	return new Date(Date.now() - DEFAULT_WINDOW_HOURS * 60 * 60 * 1000);
-}
+// No implicit lower bound — matches the Sessions route. A caller that
+// omits a start means "every retained user"; the 24h floor that used to
+// live here emptied the Users tab for anyone idle more than a day.
 
 export async function GET(request: Request) {
 	let auth;
@@ -82,7 +79,7 @@ export async function GET(request: Request) {
 		limit: limitRaw ? Number(limitRaw) : undefined,
 		offset: offsetRaw ? Number(offsetRaw) : undefined,
 		vendor: sp.get("vendor"),
-		since: sp.get("since") ? new Date(sp.get("since") as string) : defaultSince(),
+		since: sp.get("since") ? new Date(sp.get("since") as string) : null,
 		until: sp.get("until") ? new Date(sp.get("until") as string) : null,
 		sortBy: asSortBy(sp.get("sortBy")),
 		sortDir: asSortDir(sp.get("sortDir")),
@@ -139,8 +136,8 @@ export async function POST(request: Request) {
 		offset,
 		withTotal: true,
 		vendor: asString(runFilters.vendor),
-		// Default 24h window — same rationale as Sessions route.
-		since: asDate(body.timeLimit?.start) ?? defaultSince(),
+		// Unbounded when the caller sends no start — all retained users.
+		since: asDate(body.timeLimit?.start),
 		until: asDate(body.timeLimit?.end),
 		sortBy: asSortBy(body.sorting?.type),
 		sortDir: asSortDir(body.sorting?.direction),
